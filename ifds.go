@@ -11,9 +11,6 @@ import (
 	"golang.org/x/tools/go/ssa/ssautil"
 )
 
-// The target program. Notice we call buildQuery TWICE.
-// The algorithm will trace q1 completely, generate a Summary Edge,
-// and when it tracks q2, it will use the summary and bypass the function!
 const targetCode = `
 package main
 type DB struct{}
@@ -27,194 +24,181 @@ func buildQuery(table string) string {
 func main() {
     db := &DB{}
     
-    // Call Site 1
-    q1 := buildQuery("users")
-    db.Query(q1) // SINK 1
+    q1 := buildQuery("users") // Call 1
+    db.Query(q1)              // Sink 1
 
-    // Call Site 2
-    q2 := buildQuery("admins")
-    db.Query(q2) // SINK 2
+    q2 := buildQuery("admins")// Call 2 (Should use Summary Cache!)
+    db.Query(q2)              // Sink 2
 }
 `
 
-// ProgramPoint (n): A location in the Supergraph.
+// ProgramPoint (v): A location in the CFG.
 type ProgramPoint struct {
 	Block *ssa.BasicBlock
 	Index int
 }
 
-// PathEdge <d1, n, d2>: Tracks a fact (d2) through a function,
-// remembering the context (d1) of how we entered the function backwards.
-type PathEdge struct {
-	ContextFact ssa.Value    // d1 (Fact at the function's boundary)
-	Point       ProgramPoint // n  (Current location)
-	CurrentFact ssa.Value    // d2 (Fact right now)
+// ExplodedNode ⟨v, d⟩: Pairs a CFG node with a Dataflow Fact.
+type ExplodedNode struct {
+	Point ProgramPoint // The v
+	Fact  ssa.Value    // The d
 }
 
-// SummaryCache: <Function -> <d1 -> []d2>>
-// Automatically maps a tracked return value to the parameters that caused it.
+// PathEdge ⟨v1, d1⟩ ⇝ ⟨v2, d2⟩: Connects the function entry context to the current state.
+// (Note: In reverse analysis, v1 is the Return site, and it walks backwards to the Entry site).
+type PathEdge struct {
+	Start ExplodedNode // ⟨v1, d1⟩
+	End   ExplodedNode // ⟨v2, d2⟩
+}
+
+// SummaryCache: Maps Function -> (StartFact d1 -> EndFact d2)
+// When a PathEdge safely crosses an entire function, it creates a Summary.
 type SummaryCache map[*ssa.Function]map[ssa.Value][]ssa.Value
 
 func main() {
-	// 1. Setup and Build Go SSA
 	fset := token.NewFileSet()
 	f, _ := parser.ParseFile(fset, "main.go", targetCode, 0)
 	pkg := types.NewPackage("main", "")
 	ssaPkg, _, _ := ssautil.BuildPackage(&types.Config{Importer: nil}, fset, pkg, []*ast.File{f}, ssa.SanityCheckFunctions)
 	ssaPkg.Build()
 
+	// The 'P' set from the book: The set of discovered PathEdges
+	P_set := make(map[PathEdge]bool)
 	var worklist []PathEdge
-	visited := make(map[PathEdge]bool)
 	summaries := make(SummaryCache)
 
-	// 2. Find all Sinks and Push Initial PathEdges
+	// 1. Initialize P set with the Sinks
 	mainFunc := ssaPkg.Func("main")
 	for _, block := range mainFunc.Blocks {
 		for i, instr := range block.Instrs {
 			if call, ok := instr.(*ssa.Call); ok && call.Common().Value.Name() == "Query" {
-				// We track the 2nd argument (the query string). Index 1.
-				fact := call.Common().Args[1]
-				worklist = append(worklist, PathEdge{
-					ContextFact: fact,
-					Point:       ProgramPoint{Block: block, Index: i},
-					CurrentFact: fact,
-				})
-				fmt.Printf(">> Found Sink! Initializing track for: %s\n", formatVal(fact))
+				val := call.Common().Args[1]
+
+				// ⟨v1, d1⟩
+				startContext := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
+
+				// Initial edge: ⟨v1, d1⟩ ⇝ ⟨v1, d1⟩
+				initialEdge := PathEdge{Start: startContext, End: startContext}
+
+				worklist = append(worklist, initialEdge)
+				P_set[initialEdge] = true
 			}
 		}
 	}
 
-	fmt.Println("\n>> Starting IFDS Tabulation Traversal (Reverse)...")
+	fmt.Println(">> Starting Mathematically Strict IFDS...")
 
-	// 3. IFDS Tabulation Worklist Solver
+	// 2. Build the P set (Worklist Solver)
 	for len(worklist) > 0 {
 		edge := worklist[0]
 		worklist = worklist[1:]
 
-		if visited[edge] {
+		// We extract the Current State: ⟨v2, d2⟩
+		v2 := edge.End.Point
+		d2 := edge.End.Fact
+
+		if _, isConst := d2.(*ssa.Const); isConst {
+			fmt.Printf("\n[Source Found] Constant string: %s\n", d2.String())
 			continue
 		}
-		visited[edge] = true
 
-		// If we hit a hardcoded string, print the taint source and stop tracking this path
-		if _, isConst := edge.CurrentFact.(*ssa.Const); isConst {
-			fmt.Printf("\n[Source Found] Value traced back to constant: %s\n", edge.CurrentFact.String())
-			continue
-		}
+		instr := v2.Block.Instrs[v2.Index]
 
-		instr := edge.Point.Block.Instrs[edge.Point.Index]
-
-		// --- A. CALL INSTRUCTION FLOW ---
 		if callInstr, ok := instr.(ssa.CallInstruction); ok {
 
-			// 1. CallToReturn Flow (Bypassing unaffected local facts)
-			for _, bypassFact := range CallToReturnFlow(callInstr, edge.CurrentFact) {
-				for _, prevPoint := range getPredecessors(edge.Point) {
-					worklist = append(worklist, PathEdge{
-						ContextFact: edge.ContextFact,
-						Point:       prevPoint,
-						CurrentFact: bypassFact,
-					})
-				}
-			}
-
-			// 2. CallFlow (Entering Callee Backwards)
-			if callVal, ok := callInstr.(ssa.Value); ok && callVal == edge.CurrentFact {
+			// --- CALL FLOW (Diving completely into a new function) ---
+			if callVal, ok := callInstr.(ssa.Value); ok && callVal == d2 {
 				callee := callInstr.Common().StaticCallee()
 				if callee != nil {
-					// === IFDS MAGIC: CHECK SUMMARY CACHE ===
-					if cacheFunc, ok := summaries[callee]; ok {
-						if cachedResults, exists := cacheFunc[edge.CurrentFact]; exists {
-							fmt.Printf("\n[Summary Hit!] Bypassing '%s'. Transforming %s instantly.\n", callee.Name(), formatVal(edge.CurrentFact))
 
-							for _, cachedD2 := range cachedResults {
-								// 1. cachedD2 is the parameter we tracked back to. Find its index.
-								paramIndex := -1
-								for i, param := range callee.Params {
-									if param == cachedD2 {
-										paramIndex = i
-										break
-									}
-								}
-
-								// 2. Map that parameter backward to the argument passed by the caller
+					// SUMMARY LOOKUP
+					if cache, ok := summaries[callee]; ok {
+						if cachedResults, exists := cache[d2]; exists {
+							fmt.Printf("[Summary Hit!] Using cached traversal for '%s'.\n", callee.Name())
+							for _, paramD2 := range cachedResults {
+								paramIndex := getParamIndex(callee, paramD2)
 								if paramIndex != -1 {
 									arg := callInstr.Common().Args[paramIndex]
-									for _, prevPoint := range getPredecessors(edge.Point) {
-										worklist = append(worklist, PathEdge{
-											ContextFact: edge.ContextFact,
-											Point:       prevPoint,
-											CurrentFact: arg, // Using the correctly mapped argument!
+									for _, prevPoint := range getPredecessors(v2) {
+										pushToPathEdges(&worklist, P_set, PathEdge{
+											Start: edge.Start, // Original context preserved
+											End:   ExplodedNode{Point: prevPoint, Fact: arg},
 										})
 									}
 								}
 							}
-							continue // STOP evaluating this function. We used the summary!
+							continue
 						}
 					}
 
-					// === IF SUMMARY MISSES: EXPLORE CALLEE (CallFlow) ===
-					fmt.Printf("[CallFlow] Diving backward into %s...\n", callee.Name())
+					// NO SUMMARY: Create a completely NEW Context Boundary ⟨v1_new, d1_new⟩
+					fmt.Printf("[CallFlow] Creating new PathEdge analysis inside '%s'\n", callee.Name())
 					for _, block := range callee.Blocks {
 						for i, retInstr := range block.Instrs {
 							if ret, ok := retInstr.(*ssa.Return); ok {
-								// d1 (Context) safely becomes the returned value
-								newContext := ret.Results[0]
-								worklist = append(worklist, PathEdge{
-									ContextFact: newContext,
-									Point:       ProgramPoint{Block: block, Index: i},
-									CurrentFact: newContext,
+								// ⟨v1_new, d1_new⟩
+								newStartContext := ExplodedNode{
+									Point: ProgramPoint{Block: block, Index: i},
+									Fact:  ret.Results[0],
+								}
+								// ⟨v1_new, d1_new⟩ ⇝ ⟨v1_new, d1_new⟩
+								pushToPathEdges(&worklist, P_set, PathEdge{
+									Start: newStartContext,
+									End:   newStartContext,
 								})
 							}
 						}
 					}
 				}
-			}
-
-			// --- B. ENTRY NODE FLOW (EXITING CALLEE) ---
-		} else if isEntryNode(edge.Point) {
-			fn := edge.Point.Block.Parent()
-
-			// Try to map the current fact to a function parameter
-			paramIndex := -1
-			for i, param := range fn.Params {
-				if param == edge.CurrentFact {
-					paramIndex = i
-					break
+			} else {
+				// CallToReturn Flow (Bypass local variables)
+				for _, prevPoint := range getPredecessors(v2) {
+					pushToPathEdges(&worklist, P_set, PathEdge{
+						Start: edge.Start,
+						End:   ExplodedNode{Point: prevPoint, Fact: d2},
+					})
 				}
 			}
 
+		} else if isEntryNode(v2) {
+			// --- RETURN FLOW (Reached function boundary) ---
+			fn := v2.Block.Parent()
+			paramIndex := getParamIndex(fn, d2)
+
 			if paramIndex != -1 {
-				// === IFDS MAGIC: CREATE SUMMARY EDGE (d1 -> d2) ===
+				// We reached the opposite boundary! The PathEdge is complete.
+				// We extract d1 from Start Fact, and d2 from End Fact to build the Summary Edge.
+				d1 := edge.Start.Fact
+
 				if summaries[fn] == nil {
 					summaries[fn] = make(map[ssa.Value][]ssa.Value)
 				}
-				summaries[fn][edge.ContextFact] = append(summaries[fn][edge.ContextFact], edge.CurrentFact)
-				fmt.Printf("[Summary Created] Function '%s': Mapping <Ret: %s> -> <Param Index: %d>\n", fn.Name(), formatVal(edge.ContextFact), paramIndex)
+				summaries[fn][d1] = append(summaries[fn][d1], d2)
+				fmt.Printf("[Summary Added] ⟨%s⟩ ⇝ ⟨%s⟩ recorded for '%s'\n", formatVal(d1), formatVal(d2), fn.Name())
 
-				// Push Fact back to all callers (Mock Callgraph ReturnFlow)
+				// Map the parameter back up to all Callers
 				for _, caller := range getMockCallers(fn) {
 					callerPoint := getInstructionPoint(caller)
+					arg := caller.Common().Args[paramIndex]
 					for _, prevPoint := range getPredecessors(callerPoint) {
-						arg := caller.Common().Args[paramIndex]
-						worklist = append(worklist, PathEdge{
-							ContextFact: arg, // Resetting context to the caller's scope
-							Point:       prevPoint,
-							CurrentFact: arg,
+						// Crucial: Notice how the Context (Start) resets to whatever it was BEFORE the caller called it.
+						// Since we fake the Callgraph Return here, we seed a new "continuation" in the Caller.
+						pushToPathEdges(&worklist, P_set, PathEdge{
+							Start: ExplodedNode{Point: prevPoint, Fact: arg}, // Reset context to caller scope
+							End:   ExplodedNode{Point: prevPoint, Fact: arg},
 						})
 					}
 				}
 			}
 
-			// --- C. NORMAL INSTRUCTION FLOW ---
 		} else {
-			newFacts := NormalFlow(instr, edge.CurrentFact)
-			for _, prevPoint := range getPredecessors(edge.Point) {
-				for _, nf := range newFacts {
-					worklist = append(worklist, PathEdge{
-						ContextFact: edge.ContextFact, // Context passes through
-						Point:       prevPoint,
-						CurrentFact: nf,
+			// --- NORMAL FLOW (Move v2, d2 incrementally) ---
+			newFacts := NormalFlow(instr, d2)
+			for _, prevPoint := range getPredecessors(v2) {
+				for _, nd2 := range newFacts {
+					pushToPathEdges(&worklist, P_set, PathEdge{
+						Start: edge.Start,                                // v1, d1 stays exactly the same
+						End:   ExplodedNode{Point: prevPoint, Fact: nd2}, // v2, d2 updates
 					})
 				}
 			}
@@ -222,40 +206,44 @@ func main() {
 	}
 }
 
-// ==========================================
-// TRANSFER FUNCTIONS AND UTILS
-// ==========================================
+// Safely adds a PathEdge to the P Set if it hasn't been discovered yet
+func pushToPathEdges(worklist *[]PathEdge, pSet map[PathEdge]bool, edge PathEdge) {
+	if !pSet[edge] {
+		pSet[edge] = true
+		*worklist = append(*worklist, edge)
+	}
+}
 
-// NormalFlow handles assignments and operations (Kill/Gen logic)
+// (Other utility functions remain the same: NormalFlow, getPredecessors, getMockCallers, formatVal, etc)
+
 func NormalFlow(instr ssa.Instruction, fact ssa.Value) []ssa.Value {
 	if instrVal, ok := instr.(ssa.Value); ok && instrVal == fact {
 		var newFacts []ssa.Value
 		for _, opPtr := range instr.Operands(nil) {
 			if opPtr != nil && *opPtr != nil {
-				newFacts = append(newFacts, *opPtr)
+				newFacts = append(newFacts, *opPtr) // Kill / Gen
 			}
 		}
 		return newFacts
 	} else if store, ok := instr.(*ssa.Store); ok && store.Addr == fact {
-		return []ssa.Value{store.Val} // Tracing backwards through memory store
+		return []ssa.Value{store.Val}
 	}
-	return []ssa.Value{fact}
+	return []ssa.Value{fact} // Flow through unmodified
 }
 
-// CallToReturnFlow bypasses local variables safely over function calls
-func CallToReturnFlow(call ssa.CallInstruction, fact ssa.Value) []ssa.Value {
-	if callVal, ok := call.(ssa.Value); ok && callVal == fact {
-		return nil // Value was created here, it gets killed for the bypass
+func getParamIndex(fn *ssa.Function, fact ssa.Value) int {
+	for i, param := range fn.Params {
+		if param == fact {
+			return i
+		}
 	}
-	return []ssa.Value{fact} // Fact is untouched by the function, passes through
+	return -1
 }
 
-// isEntryNode determines if we have hit the top of a function while traversing backwards
 func isEntryNode(node ProgramPoint) bool {
 	return node.Index == 0 && node.Block.Index == 0
 }
 
-// getPredecessors resolves standard CFG edges reversed
 func getPredecessors(p ProgramPoint) []ProgramPoint {
 	if p.Index > 0 {
 		return []ProgramPoint{{Block: p.Block, Index: p.Index - 1}}
@@ -269,16 +257,13 @@ func getPredecessors(p ProgramPoint) []ProgramPoint {
 	return preds
 }
 
-// formatVal returns a pretty string for a variable
 func formatVal(v ssa.Value) string {
 	if v.Name() != "" {
-		return fmt.Sprintf("'%s'", v.Name())
+		return v.Name()
 	}
 	return fmt.Sprintf("%T", v)
 }
 
-// getMockCallers looks through the whole package to find where a function is called.
-// This simulates pulling CallGraph edges dynamically.
 func getMockCallers(fn *ssa.Function) []ssa.CallInstruction {
 	var callers []ssa.CallInstruction
 	for _, member := range fn.Package().Members {
