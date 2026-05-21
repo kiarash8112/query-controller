@@ -11,9 +11,11 @@ import (
 	"golang.org/x/tools/go/ssa/ssautil"
 )
 
+// The target program. Notice we call buildQuery TWICE.
+// The algorithm will trace q1 completely, generate a Summary Edge,
+// and when it tracks q2, it will use the summary and bypass the function!
 const targetCode = `
 package main
-
 type DB struct{}
 func (db *DB) Query(q string) {}
 
@@ -24,12 +26,14 @@ func buildQuery(table string) string {
 
 func main() {
     db := &DB{}
-    userInput := "users"
     
-    q := buildQuery(userInput)
+    // Call Site 1
+    q1 := buildQuery("users")
+    db.Query(q1) // SINK 1
 
-    // SINK
-    db.Query(q)
+    // Call Site 2
+    q2 := buildQuery("admins")
+    db.Query(q2) // SINK 2
 }
 `
 
@@ -39,109 +43,192 @@ type ProgramPoint struct {
 	Index int
 }
 
-// ExplodedNode (n, d): A pair representing a node in the Exploded Supergraph.
-type ExplodedNode struct {
-	Point ProgramPoint
-	Fact  ssa.Value // The Dataflow Fact (d)
+// PathEdge <d1, n, d2>: Tracks a fact (d2) through a function,
+// remembering the context (d1) of how we entered the function backwards.
+type PathEdge struct {
+	ContextFact ssa.Value    // d1 (Fact at the function's boundary)
+	Point       ProgramPoint // n  (Current location)
+	CurrentFact ssa.Value    // d2 (Fact right now)
 }
 
-func main() {
-	// 1. Build SSA Representation
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "main.go", targetCode, 0)
-	if err != nil {
-		panic(err)
-	}
+// SummaryCache: <Function -> <d1 -> []d2>>
+// Automatically maps a tracked return value to the parameters that caused it.
+type SummaryCache map[*ssa.Function]map[ssa.Value][]ssa.Value
 
+func main() {
+	// 1. Setup and Build Go SSA
+	fset := token.NewFileSet()
+	f, _ := parser.ParseFile(fset, "main.go", targetCode, 0)
 	pkg := types.NewPackage("main", "")
-	ssaPkg, _, err := ssautil.BuildPackage(
-		&types.Config{Importer: nil}, fset, pkg, []*ast.File{f}, ssa.SanityCheckFunctions,
-	)
-	if err != nil {
-		panic(err)
-	}
+	ssaPkg, _, _ := ssautil.BuildPackage(&types.Config{Importer: nil}, fset, pkg, []*ast.File{f}, ssa.SanityCheckFunctions)
 	ssaPkg.Build()
 
-	// 2. Initialize Worklist (Graph Reachability Algorithm)
-	var worklist []ExplodedNode
-	visited := make(map[ExplodedNode]bool)
+	var worklist []PathEdge
+	visited := make(map[PathEdge]bool)
+	summaries := make(SummaryCache)
 
-	// Find the Sink and create the initial ExplodedNode (Start Node)
+	// 2. Find all Sinks and Push Initial PathEdges
 	mainFunc := ssaPkg.Func("main")
 	for _, block := range mainFunc.Blocks {
 		for i, instr := range block.Instrs {
 			if call, ok := instr.(*ssa.Call); ok && call.Common().Value.Name() == "Query" {
-				fmt.Println(">> Found Sink! Starting Reachability on Exploded Supergraph...")
-				startNode := ExplodedNode{
-					Point: ProgramPoint{Block: block, Index: i},
-					Fact:  call.Common().Args[1],
-				}
-				worklist = append(worklist, startNode)
+				// We track the 2nd argument (the query string). Index 1.
+				fact := call.Common().Args[1]
+				worklist = append(worklist, PathEdge{
+					ContextFact: fact,
+					Point:       ProgramPoint{Block: block, Index: i},
+					CurrentFact: fact,
+				})
+				fmt.Printf(">> Found Sink! Initializing track for: %s\n", formatVal(fact))
 			}
 		}
 	}
 
-	// 3. IFDS Worklist Algorithm (Exploded Supergraph Traversal)
+	fmt.Println("\n>> Starting IFDS Tabulation Traversal (Reverse)...")
+
+	// 3. IFDS Tabulation Worklist Solver
 	for len(worklist) > 0 {
-		node := worklist[0]
+		edge := worklist[0]
 		worklist = worklist[1:]
 
-		if visited[node] {
+		if visited[edge] {
 			continue
 		}
-		visited[node] = true
+		visited[edge] = true
 
-		if _, isConst := node.Fact.(*ssa.Const); isConst {
-			fmt.Printf("[Source Found] Hardcoded Trace End: %s\n", node.Fact.String())
+		// If we hit a hardcoded string, print the taint source and stop tracking this path
+		if _, isConst := edge.CurrentFact.(*ssa.Const); isConst {
+			fmt.Printf("\n[Source Found] Value traced back to constant: %s\n", edge.CurrentFact.String())
 			continue
 		}
 
-		instr := node.Point.Block.Instrs[node.Point.Index]
-		var nextNodes []ExplodedNode
+		instr := edge.Point.Block.Instrs[edge.Point.Index]
 
-		// --- TRANSFER FUNCTION DEMULTIPLEXER ---
+		// --- A. CALL INSTRUCTION FLOW ---
 		if callInstr, ok := instr.(ssa.CallInstruction); ok {
 
-			// Transfer 1: CallToReturn Flow (Bypass into previous instruction in Caller)
-			bypassFacts := CallToReturnFlow(callInstr, node.Fact)
-			for _, prevPoint := range getPredecessors(node.Point) {
-				for _, bf := range bypassFacts {
-					nextNodes = append(nextNodes, ExplodedNode{Point: prevPoint, Fact: bf})
+			// 1. CallToReturn Flow (Bypassing unaffected local facts)
+			for _, bypassFact := range CallToReturnFlow(callInstr, edge.CurrentFact) {
+				for _, prevPoint := range getPredecessors(edge.Point) {
+					worklist = append(worklist, PathEdge{
+						ContextFact: edge.ContextFact,
+						Point:       prevPoint,
+						CurrentFact: bypassFact,
+					})
 				}
 			}
 
-			// Transfer 2: Call Flow (Jump backwards into Callee's return statements)
-			nextNodes = append(nextNodes, CallFlow(callInstr, node.Fact)...)
+			// 2. CallFlow (Entering Callee Backwards)
+			if callVal, ok := callInstr.(ssa.Value); ok && callVal == edge.CurrentFact {
+				callee := callInstr.Common().StaticCallee()
+				if callee != nil {
+					// === IFDS MAGIC: CHECK SUMMARY CACHE ===
+					if cacheFunc, ok := summaries[callee]; ok {
+						if cachedResults, exists := cacheFunc[edge.CurrentFact]; exists {
+							fmt.Printf("\n[Summary Hit!] Bypassing '%s'. Transforming %s instantly.\n", callee.Name(), formatVal(edge.CurrentFact))
 
-		} else if isEntryNode(node.Point) {
+							for _, cachedD2 := range cachedResults {
+								// 1. cachedD2 is the parameter we tracked back to. Find its index.
+								paramIndex := -1
+								for i, param := range callee.Params {
+									if param == cachedD2 {
+										paramIndex = i
+										break
+									}
+								}
 
-			// Transfer 3: Return Flow (Jump backwards out of Callee to Caller's call site)
-			nextNodes = append(nextNodes, ReturnFlow(node.Point, node.Fact)...)
+								// 2. Map that parameter backward to the argument passed by the caller
+								if paramIndex != -1 {
+									arg := callInstr.Common().Args[paramIndex]
+									for _, prevPoint := range getPredecessors(edge.Point) {
+										worklist = append(worklist, PathEdge{
+											ContextFact: edge.ContextFact,
+											Point:       prevPoint,
+											CurrentFact: arg, // Using the correctly mapped argument!
+										})
+									}
+								}
+							}
+							continue // STOP evaluating this function. We used the summary!
+						}
+					}
 
+					// === IF SUMMARY MISSES: EXPLORE CALLEE (CallFlow) ===
+					fmt.Printf("[CallFlow] Diving backward into %s...\n", callee.Name())
+					for _, block := range callee.Blocks {
+						for i, retInstr := range block.Instrs {
+							if ret, ok := retInstr.(*ssa.Return); ok {
+								// d1 (Context) safely becomes the returned value
+								newContext := ret.Results[0]
+								worklist = append(worklist, PathEdge{
+									ContextFact: newContext,
+									Point:       ProgramPoint{Block: block, Index: i},
+									CurrentFact: newContext,
+								})
+							}
+						}
+					}
+				}
+			}
+
+			// --- B. ENTRY NODE FLOW (EXITING CALLEE) ---
+		} else if isEntryNode(edge.Point) {
+			fn := edge.Point.Block.Parent()
+
+			// Try to map the current fact to a function parameter
+			paramIndex := -1
+			for i, param := range fn.Params {
+				if param == edge.CurrentFact {
+					paramIndex = i
+					break
+				}
+			}
+
+			if paramIndex != -1 {
+				// === IFDS MAGIC: CREATE SUMMARY EDGE (d1 -> d2) ===
+				if summaries[fn] == nil {
+					summaries[fn] = make(map[ssa.Value][]ssa.Value)
+				}
+				summaries[fn][edge.ContextFact] = append(summaries[fn][edge.ContextFact], edge.CurrentFact)
+				fmt.Printf("[Summary Created] Function '%s': Mapping <Ret: %s> -> <Param Index: %d>\n", fn.Name(), formatVal(edge.ContextFact), paramIndex)
+
+				// Push Fact back to all callers (Mock Callgraph ReturnFlow)
+				for _, caller := range getMockCallers(fn) {
+					callerPoint := getInstructionPoint(caller)
+					for _, prevPoint := range getPredecessors(callerPoint) {
+						arg := caller.Common().Args[paramIndex]
+						worklist = append(worklist, PathEdge{
+							ContextFact: arg, // Resetting context to the caller's scope
+							Point:       prevPoint,
+							CurrentFact: arg,
+						})
+					}
+				}
+			}
+
+			// --- C. NORMAL INSTRUCTION FLOW ---
 		} else {
-
-			// Transfer 4: Normal Flow (Standard instruction Kill/Gen)
-			newFacts := NormalFlow(instr, node.Fact)
-			for _, prevPoint := range getPredecessors(node.Point) {
+			newFacts := NormalFlow(instr, edge.CurrentFact)
+			for _, prevPoint := range getPredecessors(edge.Point) {
 				for _, nf := range newFacts {
-					nextNodes = append(nextNodes, ExplodedNode{Point: prevPoint, Fact: nf})
+					worklist = append(worklist, PathEdge{
+						ContextFact: edge.ContextFact, // Context passes through
+						Point:       prevPoint,
+						CurrentFact: nf,
+					})
 				}
 			}
 		}
-
-		// Add newly discovered exploded nodes to the worklist
-		worklist = append(worklist, nextNodes...)
 	}
 }
 
 // ==========================================
-// MATHEMATICAL TRANSFER FUNCTIONS (REVERSE)
+// TRANSFER FUNCTIONS AND UTILS
 // ==========================================
 
-// 1. NormalFlow: D -> 2^D (Standard Statement Transformer)
+// NormalFlow handles assignments and operations (Kill/Gen logic)
 func NormalFlow(instr ssa.Instruction, fact ssa.Value) []ssa.Value {
 	if instrVal, ok := instr.(ssa.Value); ok && instrVal == fact {
-		// Fact killed. Operands generated.
 		var newFacts []ssa.Value
 		for _, opPtr := range instr.Operands(nil) {
 			if opPtr != nil && *opPtr != nil {
@@ -150,96 +237,29 @@ func NormalFlow(instr ssa.Instruction, fact ssa.Value) []ssa.Value {
 		}
 		return newFacts
 	} else if store, ok := instr.(*ssa.Store); ok && store.Addr == fact {
-		return []ssa.Value{store.Val}
+		return []ssa.Value{store.Val} // Tracing backwards through memory store
 	}
 	return []ssa.Value{fact}
 }
 
-// 2. CallToReturnFlow: D -> 2^D (Bypass un-affected Facts around methods)
+// CallToReturnFlow bypasses local variables safely over function calls
 func CallToReturnFlow(call ssa.CallInstruction, fact ssa.Value) []ssa.Value {
-	// If the fact was the return value of this exact call, we MUST enter the function. Kill it here.
 	if callVal, ok := call.(ssa.Value); ok && callVal == fact {
-		return nil
+		return nil // Value was created here, it gets killed for the bypass
 	}
-	// Pass fact around the function safely.
-	return []ssa.Value{fact}
+	return []ssa.Value{fact} // Fact is untouched by the function, passes through
 }
 
-// 3. CallFlow: (ProgramPoint, Fact) -> {ExplodedNodes} (Caller -> Callee)
-func CallFlow(call ssa.CallInstruction, fact ssa.Value) []ExplodedNode {
-	var targetNodes []ExplodedNode
-	if callVal, ok := call.(ssa.Value); ok && callVal == fact {
-		callee := call.Common().StaticCallee()
-		if callee == nil {
-			return nil
-		}
-
-		fmt.Printf("[Transfer] (CallFlow) Shifting graph focus down into %s's return statements\n", callee.Name())
-
-		for _, block := range callee.Blocks {
-			for i, instr := range block.Instrs {
-				if ret, ok := instr.(*ssa.Return); ok {
-					targetNodes = append(targetNodes, ExplodedNode{
-						Point: ProgramPoint{Block: block, Index: i},
-						Fact:  ret.Results[0],
-					})
-				}
-			}
-		}
-	}
-	return targetNodes
-}
-
-// 4. ReturnFlow: (ProgramPoint, Fact) -> {ExplodedNodes} (Callee -> Caller)
-func ReturnFlow(entryPoint ProgramPoint, fact ssa.Value) []ExplodedNode {
-	fn := entryPoint.Block.Parent()
-
-	// Identify if tracked fact mathematically maps to a parameter
-	paramIndex := -1
-	for i, param := range fn.Params {
-		if param == fact {
-			paramIndex = i
-			break
-		}
-	}
-	if paramIndex == -1 {
-		return nil // Fact dies mathematically (no interprocedural path)
-	}
-
-	fmt.Printf("[Transfer] (ReturnFlow) Shifting graph focus backward out of %s to its call sites\n", fn.Name())
-
-	// Mock CallGraph Edge Resolution
-	var targetNodes []ExplodedNode
-	mainFunc := fn.Prog.FuncValue(fn.Pkg.Pkg.Scope().Lookup("main").(*types.Func))
-	for _, b := range mainFunc.Blocks {
-		for i, instr := range b.Instrs {
-			if call, ok := instr.(ssa.CallInstruction); ok && call.Common().StaticCallee() == fn {
-				// Jump to the ExplodedNode representing the exact Caller Argument BEFORE the call
-				targetNodes = append(targetNodes, ExplodedNode{
-					Point: getPredecessors(ProgramPoint{Block: b, Index: i})[0], // Simplified extraction
-					Fact:  call.Common().Args[paramIndex],
-				})
-			}
-		}
-	}
-
-	return targetNodes
-}
-
-// ==========================================
-// GRAPH TRAVERSAL UTILS (SUPERGRAPH EDGES)
-// ==========================================
-
+// isEntryNode determines if we have hit the top of a function while traversing backwards
 func isEntryNode(node ProgramPoint) bool {
 	return node.Index == 0 && node.Block.Index == 0
 }
 
+// getPredecessors resolves standard CFG edges reversed
 func getPredecessors(p ProgramPoint) []ProgramPoint {
-	// Standard intra-block graph edge
 	if p.Index > 0 {
 		return []ProgramPoint{{Block: p.Block, Index: p.Index - 1}}
 	}
-	// Control-Flow block jump (crossing CFG edge reversed)
 	var preds []ProgramPoint
 	for _, predBlock := range p.Block.Preds {
 		if len(predBlock.Instrs) > 0 {
@@ -247,4 +267,42 @@ func getPredecessors(p ProgramPoint) []ProgramPoint {
 		}
 	}
 	return preds
+}
+
+// formatVal returns a pretty string for a variable
+func formatVal(v ssa.Value) string {
+	if v.Name() != "" {
+		return fmt.Sprintf("'%s'", v.Name())
+	}
+	return fmt.Sprintf("%T", v)
+}
+
+// getMockCallers looks through the whole package to find where a function is called.
+// This simulates pulling CallGraph edges dynamically.
+func getMockCallers(fn *ssa.Function) []ssa.CallInstruction {
+	var callers []ssa.CallInstruction
+	for _, member := range fn.Package().Members {
+		if callerFn, ok := member.(*ssa.Function); ok {
+			for _, b := range callerFn.Blocks {
+				for _, inst := range b.Instrs {
+					if callInst, ok := inst.(ssa.CallInstruction); ok {
+						if callInst.Common().StaticCallee() == fn {
+							callers = append(callers, callInst)
+						}
+					}
+				}
+			}
+		}
+	}
+	return callers
+}
+
+func getInstructionPoint(instr ssa.Instruction) ProgramPoint {
+	b := instr.Block()
+	for i, inst := range b.Instrs {
+		if inst == instr {
+			return ProgramPoint{Block: b, Index: i}
+		}
+	}
+	return ProgramPoint{}
 }
