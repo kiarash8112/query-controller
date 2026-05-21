@@ -59,8 +59,12 @@ func main() {
 	fset := token.NewFileSet()
 	f, _ := parser.ParseFile(fset, "main.go", targetCode, 0)
 	pkg := types.NewPackage("main", "")
-	ssaPkg, _, _ := ssautil.BuildPackage(&types.Config{Importer: nil}, fset, pkg, []*ast.File{f}, ssa.SanityCheckFunctions)
-	ssaPkg.Build()
+	// Replace your old ssautil.BuildPackage call with this:
+	ssaPkg, _, _ := ssautil.BuildPackage(
+		&types.Config{Importer: nil},
+		fset, pkg, []*ast.File{f},
+		ssa.SanityCheckFunctions|ssa.NaiveForm, // <--- Added NaiveForm here
+	)
 
 	// The 'P' set from the book: The set of discovered PathEdges
 	P_set := make(map[PathEdge]bool)
@@ -201,6 +205,43 @@ func main() {
 						End:   ExplodedNode{Point: prevPoint, Fact: nd2}, // v2, d2 updates
 					})
 				}
+			}
+		}
+	}
+
+	fmt.Println("\n==========================================")
+	fmt.Println(">> PHASE 2: IFDS FACT LOOKUP (RESULTS)")
+	fmt.Println("==========================================")
+
+	fmt.Println("\n[Query] Real Taint Sources (User Inputs):")
+	printedVars := make(map[ssa.Value]bool)
+
+	for edge := range P_set {
+		d2 := edge.End.Fact
+		v2 := edge.End.Point // The location where this fact was found
+
+		if printedVars[d2] {
+			continue
+		}
+
+		// 1. We ONLY care about root sources (Constants), not intermediate variables.
+		if c, isConst := d2.(*ssa.Const); isConst {
+
+			// 2. We ONLY want inputs generated from the user's boundary ("main"),
+			// skipping internal structural strings (like "SELECT * FROM ")
+			// generated inside library functions.
+			functionWhereFound := v2.Block.Parent().Name()
+
+			if functionWhereFound == "main" {
+				// Get exact line number
+				pos := fset.Position(d2.Pos())
+				lineInfo := ""
+				if pos.IsValid() {
+					lineInfo = fmt.Sprintf("(Line: %d)", pos.Line)
+				}
+
+				fmt.Printf(" - 🚨 Taint Input Found: %s %s\n", c.Value.ExactString(), lineInfo)
+				printedVars[d2] = true
 			}
 		}
 	}
