@@ -11,46 +11,64 @@ import (
 	"golang.org/x/tools/go/ssa/ssautil"
 )
 
+// Target code demonstrating GORM Fetch queries vs GORM Insert queries
 const targetCode = `
 package main
 
-type DB struct{}
-func (db *DB) Query(q string) {}
+type GormDB struct{}
+func (db *GormDB) Where(query interface{}, args ...interface{}) *GormDB { return db }
+func (db *GormDB) Find(dest interface{}, conds ...interface{}) *GormDB { return db }
+func (db *GormDB) Create(value interface{}) *GormDB { return db }
 
 func fetchTarget(target string) {
-    db := &DB{}
-    db.Query(target) // THE SINK
+    db := &GormDB{}
+    db.Where(target).Find(nil) // GORM FETCH SINK
+}
+
+func insertTarget(target string) {
+    db := &GormDB{}
+    db.Create(target) // GORM INSERT SINK
 }
 
 func main() {
     users := []string{"admin", "guest"}
-    db := &DB{}
+    db := &GormDB{}
 
-    // Scenario 1: Direct N+1 (True Positive)
+    // Scenario 1: Fetch N+1 (TRUE POSITIVE)
     for _, u := range users {
-        db.Query(u)
+        db.Where(u).Find(nil)
     }
 
-    // Scenario 2: Transitive N+1 (True Positive)
+    // Scenario 2: Transitive Fetch N+1 (TRUE POSITIVE)
     for _, u := range users {
         fetchTarget(u)
     }
 
-    // Scenario 3: Transitive N+1 (FALSE POSITIVE!)
+    // Scenario 3: Transitive False Positive (STATIC FETCH)
     for _, _ = range users {
         fetchTarget("SELECT * FROM static_table")
+    }
+
+    // Scenario 4: Transitive Insert (IGNORED! Not a fetch)
+    for _, u := range users {
+        insertTarget(u)
+    }
+    
+    // Scenario 5: Direct Insert (IGNORED! Not a fetch)
+    for _, u := range users {
+        db.Create(u)
     }
 }
 `
 
 // ---------------------------------------------------------
-// 1. AST PHASE: Loop Context Detection (Fixed to use Line Number)
+// 1. AST PHASE: Loop Context Detection
 // ---------------------------------------------------------
 
 type ASTLoopVisitor struct {
 	fset      *token.FileSet
 	inLoop    bool
-	LoopLines map[int]string // Line Number -> Called Function Name
+	LoopLines map[int]string
 }
 
 func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
@@ -73,13 +91,10 @@ func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
 			case *ast.SelectorExpr:
 				name = fun.Sel.Name
 			}
-
-			// Extract Line Number to create a perfect bridge to SSA
 			line := v.fset.Position(call.Pos()).Line
 			v.LoopLines[line] = name
 		}
 	}
-
 	return &ASTLoopVisitor{fset: v.fset, inLoop: isLoop, LoopLines: v.LoopLines}
 }
 
@@ -98,11 +113,9 @@ func main() {
 	ssaPkg, _, _ := ssautil.BuildPackage(&types.Config{Importer: nil}, fset, pkg, []*ast.File{f}, ssa.SanityCheckFunctions|ssa.NaiveForm)
 	ssaPkg.Build()
 
-	fmt.Println(">> STARTING AST + IFDS MERGED N+1 ANALYSIS...")
+	fmt.Println(">> STARTING AST + IFDS MERGED N+1 ANALYSIS (GORM FETCH ONLY)...")
 
-	// Pass fset into IFDS so it can look up line numbers!
 	LoopResolutions := Phase1_IFDS_Tabulation(ssaPkg, visitor.LoopLines, fset)
-
 	Phase2_VerifyNPlusOne(LoopResolutions, visitor.LoopLines)
 }
 
@@ -125,33 +138,38 @@ type PathEdge struct {
 type SummaryCache map[*ssa.Function]map[ssa.Value][]ssa.Value
 
 // ---------------------------------------------------------
-// 2. IFDS PHASE 1: Dataflow Tracing
+// 2. IFDS PHASE 1: Dataflow Tracing (Gorm Support)
 // ---------------------------------------------------------
 
 func Phase1_IFDS_Tabulation(ssaPkg *ssa.Package, loopLines map[int]string, fset *token.FileSet) map[int][]ssa.Value {
 	P_set := make(map[PathEdge]bool)
 	var worklist []PathEdge
 	summaries := make(SummaryCache)
-
-	// Map resolved IFDS data facts strictly to Line Numbers!
 	LoopResolutions := make(map[int][]ssa.Value)
 
-	// BASE CASE
+	// BASE CASE (SINK FINDER)
 	for _, mem := range ssaPkg.Members {
 		if fn, ok := mem.(*ssa.Function); ok {
 			for _, block := range fn.Blocks {
 				for i, instr := range block.Instrs {
-					if call, ok := instr.(*ssa.Call); ok && call.Common().Value.Name() == "Query" {
-						val := call.Common().Args[1]
+					if call, ok := instr.(*ssa.Call); ok {
 
-						// BRIDGE 1: Line number check
-						line := fset.Position(call.Pos()).Line
-						if loopLines[line] != "" {
-							LoopResolutions[line] = append(LoopResolutions[line], val)
+						// NEW: Check if the method is a GORM Fetch method!
+						methodName := getCallName(call)
+						sinkIndex := getGormFetchArgIndex(methodName)
+
+						if sinkIndex != -1 && len(call.Common().Args) > sinkIndex {
+							val := call.Common().Args[sinkIndex]
+
+							// BRIDGE 1: Trap direct loop fetch queries
+							line := fset.Position(call.Pos()).Line
+							if loopLines[line] != "" {
+								LoopResolutions[line] = append(LoopResolutions[line], val)
+							}
+
+							seed := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
+							addPathEdge(&worklist, P_set, PathEdge{Start: seed, End: seed})
 						}
-
-						seed := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
-						addPathEdge(&worklist, P_set, PathEdge{Start: seed, End: seed})
 					}
 				}
 			}
@@ -200,7 +218,7 @@ func Phase1_IFDS_Tabulation(ssaPkg *ssa.Package, loopLines map[int]string, fset 
 					for _, caller := range getMockCallers(fn) {
 						arg := caller.Common().Args[paramIdx]
 
-						// BRIDGE 2: Line number check when exiting Transitive loops!
+						// BRIDGE 2: Trap Wrapper loops hitting GORM Fetch methods
 						callerLine := fset.Position(caller.Pos()).Line
 						if loopLines[callerLine] != "" {
 							LoopResolutions[callerLine] = append(LoopResolutions[callerLine], arg)
@@ -252,11 +270,38 @@ func Phase2_VerifyNPlusOne(LoopResolutions map[int][]ssa.Value, LoopLines map[in
 		}
 
 		if isConstant {
-			fmt.Printf(" ✅ [FALSE POSITIVE SAFELY ELIMINATED] Line %d: Loop calls '%s', but query is static: %s\n", line, funcName, confirmedVal.String())
+			fmt.Printf(" ✅ [SAFE] Line %d: Loop calls '%s', but GORM fetch is static: %s\n", line, funcName, confirmedVal.String())
 		} else {
-			fmt.Printf(" 🚨 [TRUE N+1 VULNERABILITY DETECTED]  Line %d: Loop dynamically queries using %s\n", line, formatVal(confirmedVal))
+			fmt.Printf(" 🚨 [TRUE N+1 FETCH] Line %d: Loop dynamically fetches using %s\n", line, formatVal(confirmedVal))
 		}
 	}
+}
+
+// ============================================================================
+// GORM SINK DETECTION
+// ============================================================================
+
+func getCallName(call *ssa.Call) string {
+	if call.Call.Method != nil {
+		return call.Call.Method.Name()
+	}
+	if callee := call.Call.StaticCallee(); callee != nil {
+		return callee.Name()
+	}
+	return ""
+}
+
+// Returns the index of the queried variable for Gorm FETCH methods
+func getGormFetchArgIndex(methodName string) int {
+	switch methodName {
+	// EXPLICIT WHITELIST: Fetch APIs only.
+	// Operations like Create, Save, Update, Delete will return -1 and be ignored!
+	case "Where", "Raw", "Not", "Or", "Select", "Find", "First", "Last", "Take", "Scan", "Pluck":
+		return 1 // Arg 0 is the receiver string (*GormDB). Arg 1 is the string/variable!
+	case "Query", "QueryRow", "Exec":
+		return 1 // Retained standard library support
+	}
+	return -1
 }
 
 // ============================================================================
