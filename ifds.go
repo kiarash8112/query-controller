@@ -13,277 +13,285 @@ import (
 
 const targetCode = `
 package main
+
 type DB struct{}
 func (db *DB) Query(q string) {}
 
-func buildQuery(table string) string {
-    res := "SELECT * FROM " + table
-    return res
+func fetchTarget(target string) {
+    db := &DB{}
+    db.Query(target) // THE SINK
 }
 
 func main() {
+    users := []string{"admin", "guest"}
     db := &DB{}
-    
-    q1 := buildQuery("users") // Call 1
-    db.Query(q1)              // Sink 1
 
-    q2 := buildQuery("admins")// Call 2 (Should use Summary Cache!)
-    db.Query(q2)              // Sink 2
+    // Scenario 1: Direct N+1 (True Positive)
+    for _, u := range users {
+        db.Query(u)
+    }
+
+    // Scenario 2: Transitive N+1 (True Positive)
+    for _, u := range users {
+        fetchTarget(u)
+    }
+
+    // Scenario 3: Transitive N+1 (FALSE POSITIVE!)
+    for _, _ = range users {
+        fetchTarget("SELECT * FROM static_table")
+    }
 }
 `
 
-// ProgramPoint (v): A location in the CFG.
-type ProgramPoint struct {
-	Block *ssa.BasicBlock
-	Index int
+// ---------------------------------------------------------
+// 1. AST PHASE: Loop Context Detection (Fixed to use Line Number)
+// ---------------------------------------------------------
+
+type ASTLoopVisitor struct {
+	fset      *token.FileSet
+	inLoop    bool
+	LoopLines map[int]string // Line Number -> Called Function Name
 }
 
-// ExplodedNode ⟨v, d⟩: Pairs a CFG node with a Dataflow Fact.
-type ExplodedNode struct {
-	Point ProgramPoint // The v
-	Fact  ssa.Value    // The d
+func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
+	if n == nil {
+		return nil
+	}
+
+	isLoop := v.inLoop
+	switch n.(type) {
+	case *ast.ForStmt, *ast.RangeStmt:
+		isLoop = true
+	}
+
+	if isLoop {
+		if call, ok := n.(*ast.CallExpr); ok {
+			var name string
+			switch fun := call.Fun.(type) {
+			case *ast.Ident:
+				name = fun.Name
+			case *ast.SelectorExpr:
+				name = fun.Sel.Name
+			}
+
+			// Extract Line Number to create a perfect bridge to SSA
+			line := v.fset.Position(call.Pos()).Line
+			v.LoopLines[line] = name
+		}
+	}
+
+	return &ASTLoopVisitor{fset: v.fset, inLoop: isLoop, LoopLines: v.LoopLines}
 }
 
-// PathEdge ⟨v1, d1⟩ ⇝ ⟨v2, d2⟩: Connects the function entry context to the current state.
-// (Note: In reverse analysis, v1 is the Return site, and it walks backwards to the Entry site).
-type PathEdge struct {
-	Start ExplodedNode // ⟨v1, d1⟩
-	End   ExplodedNode // ⟨v2, d2⟩
-}
-
-// SummaryCache: Maps Function -> (StartFact d1 -> EndFact d2)
-// When a PathEdge safely crosses an entire function, it creates a Summary.
-type SummaryCache map[*ssa.Function]map[ssa.Value][]ssa.Value
+// ---------------------------------------------------------
+// MAIN EXECUTION
+// ---------------------------------------------------------
 
 func main() {
 	fset := token.NewFileSet()
 	f, _ := parser.ParseFile(fset, "main.go", targetCode, 0)
-	pkg := types.NewPackage("main", "")
-	// Replace your old ssautil.BuildPackage call with this:
-	ssaPkg, _, _ := ssautil.BuildPackage(
-		&types.Config{Importer: nil},
-		fset, pkg, []*ast.File{f},
-		ssa.SanityCheckFunctions|ssa.NaiveForm, // <--- Added NaiveForm here
-	)
 
-	// The 'P' set from the book: The set of discovered PathEdges
+	visitor := &ASTLoopVisitor{fset: fset, LoopLines: make(map[int]string)}
+	ast.Walk(visitor, f)
+
+	pkg := types.NewPackage("main", "")
+	ssaPkg, _, _ := ssautil.BuildPackage(&types.Config{Importer: nil}, fset, pkg, []*ast.File{f}, ssa.SanityCheckFunctions|ssa.NaiveForm)
+	ssaPkg.Build()
+
+	fmt.Println(">> STARTING AST + IFDS MERGED N+1 ANALYSIS...")
+
+	// Pass fset into IFDS so it can look up line numbers!
+	LoopResolutions := Phase1_IFDS_Tabulation(ssaPkg, visitor.LoopLines, fset)
+
+	Phase2_VerifyNPlusOne(LoopResolutions, visitor.LoopLines)
+}
+
+// ---------------------------------------------------------
+// IFDS DATA STRUCTURES
+// ---------------------------------------------------------
+
+type ProgramPoint struct {
+	Block *ssa.BasicBlock
+	Index int
+}
+type ExplodedNode struct {
+	Point ProgramPoint
+	Fact  ssa.Value
+}
+type PathEdge struct {
+	Start ExplodedNode
+	End   ExplodedNode
+}
+type SummaryCache map[*ssa.Function]map[ssa.Value][]ssa.Value
+
+// ---------------------------------------------------------
+// 2. IFDS PHASE 1: Dataflow Tracing
+// ---------------------------------------------------------
+
+func Phase1_IFDS_Tabulation(ssaPkg *ssa.Package, loopLines map[int]string, fset *token.FileSet) map[int][]ssa.Value {
 	P_set := make(map[PathEdge]bool)
 	var worklist []PathEdge
 	summaries := make(SummaryCache)
 
-	// 1. Initialize P set with the Sinks
-	mainFunc := ssaPkg.Func("main")
-	for _, block := range mainFunc.Blocks {
-		for i, instr := range block.Instrs {
-			if call, ok := instr.(*ssa.Call); ok && call.Common().Value.Name() == "Query" {
-				val := call.Common().Args[1]
+	// Map resolved IFDS data facts strictly to Line Numbers!
+	LoopResolutions := make(map[int][]ssa.Value)
 
-				// ⟨v1, d1⟩
-				startContext := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
+	// BASE CASE
+	for _, mem := range ssaPkg.Members {
+		if fn, ok := mem.(*ssa.Function); ok {
+			for _, block := range fn.Blocks {
+				for i, instr := range block.Instrs {
+					if call, ok := instr.(*ssa.Call); ok && call.Common().Value.Name() == "Query" {
+						val := call.Common().Args[1]
 
-				// Initial edge: ⟨v1, d1⟩ ⇝ ⟨v1, d1⟩
-				initialEdge := PathEdge{Start: startContext, End: startContext}
+						// BRIDGE 1: Line number check
+						line := fset.Position(call.Pos()).Line
+						if loopLines[line] != "" {
+							LoopResolutions[line] = append(LoopResolutions[line], val)
+						}
 
-				worklist = append(worklist, initialEdge)
-				P_set[initialEdge] = true
+						seed := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
+						addPathEdge(&worklist, P_set, PathEdge{Start: seed, End: seed})
+					}
+				}
 			}
 		}
 	}
 
-	fmt.Println(">> Starting Mathematically Strict IFDS...")
-
-	// 2. Build the P set (Worklist Solver)
+	// WORKLIST TABULATION ALGORITHM
 	for len(worklist) > 0 {
 		edge := worklist[0]
 		worklist = worklist[1:]
 
-		// We extract the Current State: ⟨v2, d2⟩
 		v2 := edge.End.Point
 		d2 := edge.End.Fact
-
-		if _, isConst := d2.(*ssa.Const); isConst {
-			fmt.Printf("\n[Source Found] Constant string: %s\n", d2.String())
-			continue
-		}
-
 		instr := v2.Block.Instrs[v2.Index]
 
 		if callInstr, ok := instr.(ssa.CallInstruction); ok {
-
-			// --- CALL FLOW (Diving completely into a new function) ---
 			if callVal, ok := callInstr.(ssa.Value); ok && callVal == d2 {
 				callee := callInstr.Common().StaticCallee()
 				if callee != nil {
-
-					// SUMMARY LOOKUP
-					if cache, ok := summaries[callee]; ok {
-						if cachedResults, exists := cache[d2]; exists {
-							fmt.Printf("[Summary Hit!] Using cached traversal for '%s'.\n", callee.Name())
-							for _, paramD2 := range cachedResults {
-								paramIndex := getParamIndex(callee, paramD2)
-								if paramIndex != -1 {
-									arg := callInstr.Common().Args[paramIndex]
-									for _, prevPoint := range getPredecessors(v2) {
-										pushToPathEdges(&worklist, P_set, PathEdge{
-											Start: edge.Start, // Original context preserved
-											End:   ExplodedNode{Point: prevPoint, Fact: arg},
-										})
-									}
-								}
-							}
-							continue
-						}
-					}
-
-					// NO SUMMARY: Create a completely NEW Context Boundary ⟨v1_new, d1_new⟩
-					fmt.Printf("[CallFlow] Creating new PathEdge analysis inside '%s'\n", callee.Name())
 					for _, block := range callee.Blocks {
 						for i, retInstr := range block.Instrs {
 							if ret, ok := retInstr.(*ssa.Return); ok {
-								// ⟨v1_new, d1_new⟩
-								newStartContext := ExplodedNode{
-									Point: ProgramPoint{Block: block, Index: i},
-									Fact:  ret.Results[0],
-								}
-								// ⟨v1_new, d1_new⟩ ⇝ ⟨v1_new, d1_new⟩
-								pushToPathEdges(&worklist, P_set, PathEdge{
-									Start: newStartContext,
-									End:   newStartContext,
-								})
+								newCtx := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: ret.Results[0]}
+								addPathEdge(&worklist, P_set, PathEdge{Start: newCtx, End: newCtx})
 							}
 						}
 					}
 				}
 			} else {
-				// CallToReturn Flow (Bypass local variables)
-				for _, prevPoint := range getPredecessors(v2) {
-					pushToPathEdges(&worklist, P_set, PathEdge{
-						Start: edge.Start,
-						End:   ExplodedNode{Point: prevPoint, Fact: d2},
-					})
-				}
-			}
-
-		} else if isEntryNode(v2) {
-			// --- RETURN FLOW (Reached function boundary) ---
-			fn := v2.Block.Parent()
-			paramIndex := getParamIndex(fn, d2)
-
-			if paramIndex != -1 {
-				// We reached the opposite boundary! The PathEdge is complete.
-				// We extract d1 from Start Fact, and d2 from End Fact to build the Summary Edge.
-				d1 := edge.Start.Fact
-
-				if summaries[fn] == nil {
-					summaries[fn] = make(map[ssa.Value][]ssa.Value)
-				}
-				summaries[fn][d1] = append(summaries[fn][d1], d2)
-				fmt.Printf("[Summary Added] ⟨%s⟩ ⇝ ⟨%s⟩ recorded for '%s'\n", formatVal(d1), formatVal(d2), fn.Name())
-
-				// Map the parameter back up to all Callers
-				for _, caller := range getMockCallers(fn) {
-					callerPoint := getInstructionPoint(caller)
-					arg := caller.Common().Args[paramIndex]
-					for _, prevPoint := range getPredecessors(callerPoint) {
-						// Crucial: Notice how the Context (Start) resets to whatever it was BEFORE the caller called it.
-						// Since we fake the Callgraph Return here, we seed a new "continuation" in the Caller.
-						pushToPathEdges(&worklist, P_set, PathEdge{
-							Start: ExplodedNode{Point: prevPoint, Fact: arg}, // Reset context to caller scope
-							End:   ExplodedNode{Point: prevPoint, Fact: arg},
-						})
+				for _, nd2 := range applyCallToReturn(callInstr, d2) {
+					for _, prevPoint := range getPredecessors(v2) {
+						addPathEdge(&worklist, P_set, PathEdge{Start: edge.Start, End: ExplodedNode{Point: prevPoint, Fact: nd2}})
 					}
 				}
 			}
+		} else if isEntryNode(v2) {
+			fn := v2.Block.Parent()
+			for paramIdx, param := range fn.Params {
+				if param == d2 {
+					d1 := edge.Start.Fact
+					if summaries[fn] == nil {
+						summaries[fn] = make(map[ssa.Value][]ssa.Value)
+					}
+					summaries[fn][d1] = append(summaries[fn][d1], d2)
 
+					for _, caller := range getMockCallers(fn) {
+						arg := caller.Common().Args[paramIdx]
+
+						// BRIDGE 2: Line number check when exiting Transitive loops!
+						callerLine := fset.Position(caller.Pos()).Line
+						if loopLines[callerLine] != "" {
+							LoopResolutions[callerLine] = append(LoopResolutions[callerLine], arg)
+						}
+
+						callerPoint := getInstructionPoint(caller)
+						for _, prevPoint := range getPredecessors(callerPoint) {
+							addPathEdge(&worklist, P_set, PathEdge{
+								Start: ExplodedNode{Point: prevPoint, Fact: arg},
+								End:   ExplodedNode{Point: prevPoint, Fact: arg},
+							})
+						}
+					}
+				}
+			}
 		} else {
-			// --- NORMAL FLOW (Move v2, d2 incrementally) ---
-			newFacts := NormalFlow(instr, d2)
-			for _, prevPoint := range getPredecessors(v2) {
-				for _, nd2 := range newFacts {
-					pushToPathEdges(&worklist, P_set, PathEdge{
-						Start: edge.Start,                                // v1, d1 stays exactly the same
-						End:   ExplodedNode{Point: prevPoint, Fact: nd2}, // v2, d2 updates
-					})
+			for _, nd2 := range applyNormalFlow(instr, d2) {
+				for _, prevPoint := range getPredecessors(v2) {
+					addPathEdge(&worklist, P_set, PathEdge{Start: edge.Start, End: ExplodedNode{Point: prevPoint, Fact: nd2}})
 				}
 			}
 		}
 	}
+	return LoopResolutions
+}
 
+// ---------------------------------------------------------
+// 3. PHASE 2: Lookup and False Positive Validation
+// ---------------------------------------------------------
+
+func Phase2_VerifyNPlusOne(LoopResolutions map[int][]ssa.Value, LoopLines map[int]string) {
 	fmt.Println("\n==========================================")
-	fmt.Println(">> PHASE 2: IFDS FACT LOOKUP (RESULTS)")
+	fmt.Println(">> PHASE 2: IFDS FALSE POSITIVE ELIMINATION")
 	fmt.Println("==========================================")
 
-	fmt.Println("\n[Query] Real Taint Sources (User Inputs):")
-	printedVars := make(map[ssa.Value]bool)
+	for line, resolvedArgs := range LoopResolutions {
+		funcName := LoopLines[line]
 
-	for edge := range P_set {
-		d2 := edge.End.Fact
-		v2 := edge.End.Point // The location where this fact was found
+		isConstant := false
+		var confirmedVal ssa.Value
 
-		if printedVars[d2] {
-			continue
-		}
-
-		// 1. We ONLY care about root sources (Constants), not intermediate variables.
-		if c, isConst := d2.(*ssa.Const); isConst {
-
-			// 2. We ONLY want inputs generated from the user's boundary ("main"),
-			// skipping internal structural strings (like "SELECT * FROM ")
-			// generated inside library functions.
-			functionWhereFound := v2.Block.Parent().Name()
-
-			if functionWhereFound == "main" {
-				// Get exact line number
-				pos := fset.Position(d2.Pos())
-				lineInfo := ""
-				if pos.IsValid() {
-					lineInfo = fmt.Sprintf("(Line: %d)", pos.Line)
-				}
-
-				fmt.Printf(" - 🚨 Taint Input Found: %s %s\n", c.Value.ExactString(), lineInfo)
-				printedVars[d2] = true
+		for _, arg := range resolvedArgs {
+			if c, isConst := arg.(*ssa.Const); isConst {
+				isConstant = true
+				confirmedVal = c
+			} else {
+				confirmedVal = arg
 			}
 		}
+
+		if isConstant {
+			fmt.Printf(" ✅ [FALSE POSITIVE SAFELY ELIMINATED] Line %d: Loop calls '%s', but query is static: %s\n", line, funcName, confirmedVal.String())
+		} else {
+			fmt.Printf(" 🚨 [TRUE N+1 VULNERABILITY DETECTED]  Line %d: Loop dynamically queries using %s\n", line, formatVal(confirmedVal))
+		}
 	}
 }
 
-// Safely adds a PathEdge to the P Set if it hasn't been discovered yet
-func pushToPathEdges(worklist *[]PathEdge, pSet map[PathEdge]bool, edge PathEdge) {
-	if !pSet[edge] {
-		pSet[edge] = true
-		*worklist = append(*worklist, edge)
-	}
-}
+// ============================================================================
+// LOGIC UTILITIES
+// ============================================================================
 
-// (Other utility functions remain the same: NormalFlow, getPredecessors, getMockCallers, formatVal, etc)
-
-func NormalFlow(instr ssa.Instruction, fact ssa.Value) []ssa.Value {
-	if instrVal, ok := instr.(ssa.Value); ok && instrVal == fact {
+func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
+	if instrVal, ok := instr.(ssa.Value); ok && instrVal == d2 {
 		var newFacts []ssa.Value
 		for _, opPtr := range instr.Operands(nil) {
 			if opPtr != nil && *opPtr != nil {
-				newFacts = append(newFacts, *opPtr) // Kill / Gen
+				newFacts = append(newFacts, *opPtr)
 			}
 		}
 		return newFacts
-	} else if store, ok := instr.(*ssa.Store); ok && store.Addr == fact {
+	} else if store, ok := instr.(*ssa.Store); ok && store.Addr == d2 {
 		return []ssa.Value{store.Val}
 	}
-	return []ssa.Value{fact} // Flow through unmodified
+	return []ssa.Value{d2}
 }
 
-func getParamIndex(fn *ssa.Function, fact ssa.Value) int {
-	for i, param := range fn.Params {
-		if param == fact {
-			return i
-		}
+func applyCallToReturn(call ssa.CallInstruction, fact ssa.Value) []ssa.Value {
+	if callVal, ok := call.(ssa.Value); ok && callVal == fact {
+		return nil
 	}
-	return -1
+	return []ssa.Value{fact}
 }
 
-func isEntryNode(node ProgramPoint) bool {
-	return node.Index == 0 && node.Block.Index == 0
+func addPathEdge(worklist *[]PathEdge, P_set map[PathEdge]bool, edge PathEdge) {
+	if !P_set[edge] {
+		P_set[edge] = true
+		*worklist = append(*worklist, edge)
+	}
 }
+func isEntryNode(node ProgramPoint) bool { return node.Index == 0 && node.Block.Index == 0 }
 
 func getPredecessors(p ProgramPoint) []ProgramPoint {
 	if p.Index > 0 {
@@ -298,23 +306,14 @@ func getPredecessors(p ProgramPoint) []ProgramPoint {
 	return preds
 }
 
-func formatVal(v ssa.Value) string {
-	if v.Name() != "" {
-		return v.Name()
-	}
-	return fmt.Sprintf("%T", v)
-}
-
 func getMockCallers(fn *ssa.Function) []ssa.CallInstruction {
 	var callers []ssa.CallInstruction
-	for _, member := range fn.Package().Members {
-		if callerFn, ok := member.(*ssa.Function); ok {
-			for _, b := range callerFn.Blocks {
+	for _, memb := range fn.Package().Members {
+		if cFn, ok := memb.(*ssa.Function); ok {
+			for _, b := range cFn.Blocks {
 				for _, inst := range b.Instrs {
-					if callInst, ok := inst.(ssa.CallInstruction); ok {
-						if callInst.Common().StaticCallee() == fn {
-							callers = append(callers, callInst)
-						}
+					if callInst, ok := inst.(ssa.CallInstruction); ok && callInst.Common().StaticCallee() == fn {
+						callers = append(callers, callInst)
 					}
 				}
 			}
@@ -331,4 +330,11 @@ func getInstructionPoint(instr ssa.Instruction) ProgramPoint {
 		}
 	}
 	return ProgramPoint{}
+}
+
+func formatVal(v ssa.Value) string {
+	if v.Name() != "" {
+		return "'" + v.Name() + "'"
+	}
+	return fmt.Sprintf("%T", v)
 }
