@@ -251,23 +251,23 @@ func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value, LoopLocations
 	}
 
 	for locationKey, resolvedArgs := range LoopResolutions {
-		funcName := LoopLocations[locationKey]
+		//	funcName := LoopLocations[locationKey]
 
 		isDynamicVariable := false
 		var dynamicVal ssa.Value
-		var constVal string
+		//	var constVal string
 
 		for _, arg := range resolvedArgs {
-			if c, isConst := arg.(*ssa.Const); isConst {
-				constVal = c.Value.ExactString() // It's a hardcoded string
-			} else {
+
+			//	constVal = c.Value.ExactString() // It's a hardcoded string
+			if _, isConst := arg.(*ssa.Const); !isConst {
 				isDynamicVariable = true // We found a variable!
 				dynamicVal = arg
 			}
 		}
 
 		if !isDynamicVariable {
-			fmt.Printf(" ✅ [SAFE] \t%s \n\t-> Calls '%s()', but querying constants is safe: %s\n\n", locationKey, funcName, constVal)
+			//	fmt.Printf(" ✅ [SAFE] \t%s \n\t-> Calls '%s()', but querying constants is safe: %s\n\n", locationKey, funcName, constVal)
 		} else {
 			fmt.Printf(" 🚨 [TRUE N+1] \t%s \n\t-> Loop dynamically fetches using loop variable: %s\n\n", locationKey, formatVal(dynamicVal))
 		}
@@ -356,7 +356,7 @@ func getCallName(call *ssa.Call) string {
 
 func getGormFetchArgIndex(methodName string) int {
 	switch methodName {
-	case "Where", "Raw", "Not", "Or", "Select", "Find", "First", "Last", "Take", "Scan", "Pluck":
+	case "Raw", "Not", "Or", "Select", "Find", "First", "Last", "Take", "Scan", "Pluck":
 		return 1
 	case "Query", "QueryRow", "Exec":
 		return 1
