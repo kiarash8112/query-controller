@@ -36,4 +36,6 @@ func main() {
 	}
 
 	DynamicBuildExample()
+	example3()
+	example4()
 }
