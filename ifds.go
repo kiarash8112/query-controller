@@ -14,18 +14,15 @@ import (
 )
 
 // ---------------------------------------------------------
-// 1. AST PHASE: Global Loop Context Detection
-// ---------------------------------------------------------
-
-// ---------------------------------------------------------
-// 1. AST PHASE: Loop Context Detection
+// 1. AST PHASE: Loop Context Detection (With Executor Map)
 // ---------------------------------------------------------
 
 type ASTLoopVisitor struct {
 	fset          *token.FileSet
 	inLoop        bool
-	isExecLoop    bool // NEW: True if the current loop contains an Execution method
-	LoopLocations map[string]string
+	isExecLoop    bool
+	Executors     map[string]bool // Knows exactly which wrappers execute!
+	LoopLocations map[string]bool
 }
 
 func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
@@ -36,54 +33,40 @@ func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
 	isLoop := v.inLoop
 	isExecLoop := v.isExecLoop
 
-	// Detect if we are entering a loop
 	switch loopNode := n.(type) {
 	case *ast.ForStmt:
 		isLoop = true
-		isExecLoop = astContainsExecutionMethod(loopNode.Body)
+		isExecLoop = astContainsExecutionMethod(loopNode.Body, v.Executors)
 	case *ast.RangeStmt:
 		isLoop = true
-		isExecLoop = astContainsExecutionMethod(loopNode.Body)
+		isExecLoop = astContainsExecutionMethod(loopNode.Body, v.Executors)
 	}
 
-	// We ONLY flag calls inside the loop if the loop actually EXECUTES a query!
+	// HIGHLIGHT ZONE: Mark every single line inside the loop as an "Execution Zone"
 	if isLoop && isExecLoop {
-		if call, ok := n.(*ast.CallExpr); ok {
-			var name string
-			switch fun := call.Fun.(type) {
-			case *ast.Ident:
-				name = fun.Name
-			case *ast.SelectorExpr:
-				name = fun.Sel.Name
-			}
-
-			pos := v.fset.Position(call.Pos())
-			fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
-
-			v.LoopLocations[fileLineKey] = name
-		}
+		pos := v.fset.Position(n.Pos())
+		fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
+		v.LoopLocations[fileLineKey] = true
 	}
-	return &ASTLoopVisitor{fset: v.fset, inLoop: isLoop, isExecLoop: isExecLoop, LoopLocations: v.LoopLocations}
+
+	return &ASTLoopVisitor{fset: v.fset, inLoop: isLoop, isExecLoop: isExecLoop, Executors: v.Executors, LoopLocations: v.LoopLocations}
 }
 
-// HELPER: Scans a loop body to see if it triggers an actual Database Execution
-func astContainsExecutionMethod(node ast.Node) bool {
+func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
 	hasExecution := false
 	ast.Inspect(node, func(n ast.Node) bool {
 		if call, ok := n.(*ast.CallExpr); ok {
+			var name string
 			if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-				// If we see Scan, Find, First, Exec, it's an Execution Loop!
-				switch sel.Sel.Name {
-				case "Scan", "Find", "First", "Take", "Last", "Pluck", "Count", "Exec", "QueryRow", "Query":
-					hasExecution = true
-					return false // Stop searching, we proved it executes!
-				}
+				name = sel.Sel.Name
 			} else if ident, ok := call.Fun.(*ast.Ident); ok {
-				// If the loop calls a custom Wrapper Function (e.g. fetchTarget()), we assume it executes.
-				if ident.Name != "len" && ident.Name != "append" && ident.Name != "panic" {
-					hasExecution = true
-					return false
-				}
+				name = ident.Name
+			}
+
+			// Does it call a Known Executor OR a Transitive Wrapper?
+			if isExecutionMethod(name) || executors[name] {
+				hasExecution = true
+				return false
 			}
 		}
 		return true
@@ -92,59 +75,52 @@ func astContainsExecutionMethod(node ast.Node) bool {
 }
 
 // ---------------------------------------------------------
-// MAIN EXECUTION (Project Loader)
+// MAIN EXECUTION
 // ---------------------------------------------------------
+
 func main() {
-	// Parse target directory from arguments, default to current dir
-	targetDir := "/home/user/Desktop/r2basic"
+	targetDir := "."
 	if len(os.Args) > 1 {
 		targetDir = os.Args[1]
 	}
-
 	fmt.Printf(">> LOADING PROJECT: %s\n", targetDir)
 
 	fset := token.NewFileSet()
-
-	// FIX 1: Set "Dir" to the target project so it uses the target's go.mod!
 	cfg := &packages.Config{
-		Dir:  targetDir,
-		Fset: fset,
+		Dir: targetDir, Fset: fset,
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
 	}
 
-	// FIX 2: Load "./..." from inside that specific target Directory
 	initial, err := packages.Load(cfg, "./...")
 	if err != nil {
-		log.Fatalf("Failed to execute package load: %v", err)
+		log.Fatalf("Load failed: %v", err)
 	}
 
-	// FIX 3: Don't Fatal exit! Print errors, but continue analyzing whatever successfully loaded.
-	if packages.PrintErrors(initial) > 0 {
-		fmt.Println("[Warning] Some package errors occurred, but continuing analysis on successfully loaded files...")
-	}
+	// Step 1: Build Global SSA First!
+	prog, _ := ssautil.AllPackages(initial, ssa.NaiveForm)
+	prog.Build()
 
-	// Step 2: Global AST Scan
-	visitor := &ASTLoopVisitor{fset: fset, LoopLocations: make(map[string]string)}
+	allFuncs := getAllFunctions(initial, prog)
+
+	// Step 2: Dynamically calculate which wrappers are Execution functions
+	executors := buildTransitiveExecutors(allFuncs)
+
+	// Step 3: Run AST to map the loops, leveraging the Executor Map!
+	visitor := &ASTLoopVisitor{fset: fset, LoopLocations: make(map[string]bool), Executors: executors}
 	for _, pkg := range initial {
 		for _, file := range pkg.Syntax {
 			ast.Walk(visitor, file)
 		}
 	}
 
-	// Step 3: Build Global SSA Supergraph
-	fmt.Println(">> BUILDING GLOBAL SSA DATAFLOW GRAPH...")
-	prog, _ := ssautil.AllPackages(initial, ssa.NaiveForm)
-	prog.Build()
-
-	fmt.Println(">> RUNNING IFDS TABULATION ENGINE...")
-	LoopResolutions := Phase1_IFDS_Tabulation(initial, prog, visitor.LoopLocations, fset)
-
+	// Step 4: Run IFDS
+	LoopResolutions := Phase1_IFDS_Tabulation(allFuncs, visitor.LoopLocations, fset)
 	Phase2_VerifyNPlusOne(LoopResolutions, visitor.LoopLocations)
 }
 
 // ---------------------------------------------------------
-// IFDS DATA STRUCTURES
+// IFDS PHASE 1: Dataflow Tracing
 // ---------------------------------------------------------
 
 type ProgramPoint struct {
@@ -161,35 +137,27 @@ type PathEdge struct {
 }
 type SummaryCache map[*ssa.Function]map[ssa.Value][]ssa.Value
 
-// ---------------------------------------------------------
-// 2. IFDS PHASE 1: Dataflow Tracing (Global Project)
-// ---------------------------------------------------------
-
-func Phase1_IFDS_Tabulation(initial []*packages.Package, prog *ssa.Program, loopLocations map[string]string, fset *token.FileSet) map[string][]ssa.Value {
+func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopLocations map[string]bool, fset *token.FileSet) map[string][]ssa.Value {
 	P_set := make(map[PathEdge]bool)
 	var worklist []PathEdge
 	summaries := make(SummaryCache)
 	LoopResolutions := make(map[string][]ssa.Value)
 
-	allFunctions := getAllFunctions(initial, prog)
-
-	// BASE CASE (GLOBAL SINK FINDER)
+	// SINK FINDER
 	for _, fn := range allFunctions {
 		for _, block := range fn.Blocks {
 			for i, instr := range block.Instrs {
 				if call, ok := instr.(*ssa.Call); ok {
-
-					methodName := getCallName(call)
+					methodName := getCallNameFromInstr(call)
 					sinkIndex := getGormFetchArgIndex(methodName)
 
 					if sinkIndex != -1 && len(call.Common().Args) > sinkIndex {
 						val := call.Common().Args[sinkIndex]
 
-						// BRIDGE 1: Trap direct loop fetch queries using "File:Line"
 						pos := fset.Position(call.Pos())
 						fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
 
-						if loopLocations[fileLineKey] != "" {
+						if loopLocations[fileLineKey] {
 							LoopResolutions[fileLineKey] = append(LoopResolutions[fileLineKey], val)
 						}
 
@@ -201,7 +169,7 @@ func Phase1_IFDS_Tabulation(initial []*packages.Package, prog *ssa.Program, loop
 		}
 	}
 
-	// WORKLIST TABULATION ALGORITHM
+	// TABULATION ENGINE
 	for len(worklist) > 0 {
 		edge := worklist[0]
 		worklist = worklist[1:]
@@ -240,24 +208,19 @@ func Phase1_IFDS_Tabulation(initial []*packages.Package, prog *ssa.Program, loop
 					}
 					summaries[fn][d1] = append(summaries[fn][d1], d2)
 
-					// Return to all Callers globally!
 					for _, caller := range getGlobalMockCallers(fn, allFunctions) {
 						arg := caller.Common().Args[paramIdx]
 
-						// BRIDGE 2: Global Cross-File Transitive checks
 						pos := fset.Position(caller.Pos())
 						fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
 
-						if loopLocations[fileLineKey] != "" {
+						if loopLocations[fileLineKey] {
 							LoopResolutions[fileLineKey] = append(LoopResolutions[fileLineKey], arg)
 						}
 
 						callerPoint := getInstructionPoint(caller)
 						for _, prevPoint := range getPredecessors(callerPoint) {
-							addPathEdge(&worklist, P_set, PathEdge{
-								Start: ExplodedNode{Point: prevPoint, Fact: arg},
-								End:   ExplodedNode{Point: prevPoint, Fact: arg},
-							})
+							addPathEdge(&worklist, P_set, PathEdge{Start: ExplodedNode{Point: prevPoint, Fact: arg}, End: ExplodedNode{Point: prevPoint, Fact: arg}})
 						}
 					}
 				}
@@ -274,75 +237,105 @@ func Phase1_IFDS_Tabulation(initial []*packages.Package, prog *ssa.Program, loop
 }
 
 // ---------------------------------------------------------
-// 3. PHASE 2: Lookup and False Positive Validation
+// PHASE 2 & LOGIC UTILITIES
 // ---------------------------------------------------------
 
-func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value, LoopLocations map[string]string) {
+func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value, LoopLocations map[string]bool) {
 	fmt.Println("\n==========================================")
 	fmt.Println(">> PHASE 2: GORM N+1 VULNERABILITY REPORT")
 	fmt.Println("==========================================")
 
 	if len(LoopResolutions) == 0 {
-		fmt.Println(" ✅ Project Clean! No N+1 Fetch Queries detected in loops.")
+		fmt.Println(" ✅ Project Clean! No N+1 Queries detected.")
 		return
 	}
 
-	for locationKey, resolvedArgs := range LoopResolutions {
-		//	funcName := LoopLocations[locationKey]
+	vulnsFound := 0
 
+	for locationKey, resolvedArgs := range LoopResolutions {
 		isDynamicVariable := false
 		var dynamicVal ssa.Value
-		//	var constVal string
 
 		for _, arg := range resolvedArgs {
-
-			//	constVal = c.Value.ExactString() // It's a hardcoded string
 			if _, isConst := arg.(*ssa.Const); !isConst {
-				isDynamicVariable = true // We found a variable!
+				isDynamicVariable = true
 				dynamicVal = arg
 			}
 		}
 
-		if !isDynamicVariable {
-			//	fmt.Printf(" ✅ [SAFE] \t%s \n\t-> Calls '%s()', but querying constants is safe: %s\n\n", locationKey, funcName, constVal)
-		} else {
-			fmt.Printf(" 🚨 [TRUE N+1] \t%s \n\t-> Loop dynamically fetches using loop variable: %s\n\n", locationKey, formatVal(dynamicVal))
+		if isDynamicVariable {
+			vulnsFound++
+			humanName := resolveHumanName(dynamicVal)
+			fmt.Printf(" 🚨 [TRUE N+1] \t%s \n\t-> Loop dynamically fetches using variable: %s\n\n", locationKey, humanName)
 		}
+	}
+
+	if vulnsFound == 0 {
+		fmt.Println(" ✅ Project Clean! All loops use safe, hardcoded static queries.")
 	}
 }
 
-// ============================================================================
-// GLOBAL PROJECT UTILITIES
-// ============================================================================
+// Builds the list of functions that transitively trigger DB network requests.
+func buildTransitiveExecutors(funcs []*ssa.Function) map[string]bool {
+	execMap := make(map[*ssa.Function]bool)
 
-func getAllFunctions(initial []*packages.Package, prog *ssa.Program) []*ssa.Function {
-	var funcs []*ssa.Function
-
-	// 1. Identify which packages are actually part of the user's target project
-	userPackages := make(map[*types.Package]bool)
-	for _, p := range initial {
-		if p.Types != nil {
-			userPackages[p.Types] = true
+	// 1. Direct Executors (Scan, Find, Query)
+	for _, fn := range funcs {
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				if call, ok := instr.(ssa.CallInstruction); ok && isExecutionMethod(getCallNameFromInstr(call)) {
+					execMap[fn] = true
+				}
+			}
 		}
 	}
 
-	// 2. Only extract functions from the user's packages
+	// 2. Transitive Executors (Wrappers calling Executors)
+	changed := true
+	for changed {
+		changed = false
+		for _, fn := range funcs {
+			if execMap[fn] {
+				continue
+			}
+			for _, b := range fn.Blocks {
+				for _, instr := range b.Instrs {
+					if call, ok := instr.(ssa.CallInstruction); ok {
+						if callee := call.Common().StaticCallee(); callee != nil && execMap[callee] {
+							execMap[fn] = true
+							changed = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	names := make(map[string]bool)
+	for fn := range execMap {
+		names[fn.Name()] = true
+	}
+	return names
+}
+
+// Filters out unneeded Standard Library dependencies directly
+func getAllFunctions(initial []*packages.Package, prog *ssa.Program) []*ssa.Function {
+	var funcs []*ssa.Function
+	userPkgs := make(map[*types.Package]bool)
+	for _, p := range initial {
+		if p.Types != nil {
+			userPkgs[p.Types] = true
+		}
+	}
+
 	for _, pkg := range prog.AllPackages() {
-		if pkg == nil || pkg.Pkg == nil {
+		if pkg == nil || pkg.Pkg == nil || !userPkgs[pkg.Pkg] {
 			continue
 		}
-
-		// SKIP standard library and third-party dependencies!
-		if !userPackages[pkg.Pkg] {
-			continue
-		}
-
 		for _, mem := range pkg.Members {
-			// Get standard functions
 			if fn, ok := mem.(*ssa.Function); ok {
 				funcs = append(funcs, fn)
 			}
-			// Get methods attached to types
 			if t, ok := mem.(*ssa.Type); ok {
 				mset := prog.MethodSets.MethodSet(t.Type())
 				for i := 0; i < mset.Len(); i++ {
@@ -362,30 +355,19 @@ func getAllFunctions(initial []*packages.Package, prog *ssa.Program) []*ssa.Func
 	return funcs
 }
 
-// Searches ALL packages for call sites of a specific function
-func getGlobalMockCallers(fn *ssa.Function, allFunctions []*ssa.Function) []ssa.CallInstruction {
-	var callers []ssa.CallInstruction
-	for _, cFn := range allFunctions {
-		for _, b := range cFn.Blocks {
-			for _, inst := range b.Instrs {
-				if callInst, ok := inst.(ssa.CallInstruction); ok && callInst.Common().StaticCallee() == fn {
-					callers = append(callers, callInst)
-				}
-			}
-		}
+func isExecutionMethod(name string) bool {
+	switch name {
+	case "Scan", "Find", "First", "Take", "Last", "Pluck", "Count", "Exec", "QueryRow", "Query":
+		return true
 	}
-	return callers
+	return false
 }
 
-// ============================================================================
-// GORM SINK DETECTION & IFDS MATH LOGIC
-// ============================================================================
-
-func getCallName(call *ssa.Call) string {
-	if call.Call.Method != nil {
-		return call.Call.Method.Name()
+func getCallNameFromInstr(call ssa.CallInstruction) string {
+	if call.Common().Method != nil {
+		return call.Common().Method.Name()
 	}
-	if callee := call.Call.StaticCallee(); callee != nil {
+	if callee := call.Common().StaticCallee(); callee != nil {
 		return callee.Name()
 	}
 	return ""
@@ -393,14 +375,63 @@ func getCallName(call *ssa.Call) string {
 
 func getGormFetchArgIndex(methodName string) int {
 	switch methodName {
-	// IFDS DATAFLOW SINKS: Which methods handle the malicious inputs?
-	// We brought Where, Not, Or, Select back!
 	case "Where", "Raw", "Not", "Or", "Select":
 		return 1
 	case "Query", "QueryRow", "Exec":
 		return 1
 	}
 	return -1
+}
+
+func resolveHumanName(val ssa.Value) string {
+	visited := make(map[ssa.Value]bool)
+	var dfs func(v ssa.Value) string
+	dfs = func(v ssa.Value) string {
+		if v == nil || visited[v] {
+			return ""
+		}
+		visited[v] = true
+		if alloc, ok := v.(*ssa.Alloc); ok && alloc.Comment != "" {
+			return alloc.Comment
+		}
+		if param, ok := v.(*ssa.Parameter); ok && param.Name() != "" {
+			return param.Name()
+		}
+		if global, ok := v.(*ssa.Global); ok && global.Name() != "" {
+			return global.Name()
+		}
+		if fv, ok := v.(*ssa.FreeVar); ok && fv.Name() != "" {
+			return fv.Name()
+		}
+		switch x := v.(type) {
+		case *ssa.MakeInterface:
+			return dfs(x.X)
+		case *ssa.ChangeType:
+			return dfs(x.X)
+		case *ssa.Slice:
+			return dfs(x.X)
+		case *ssa.UnOp:
+			return dfs(x.X)
+		case *ssa.Extract:
+			return dfs(x.Tuple)
+		case *ssa.FieldAddr:
+			if res := dfs(x.X); res != "" {
+				return res + " (struct field)"
+			}
+		case *ssa.IndexAddr:
+			if res := dfs(x.X); res != "" {
+				return res + " (slice item)"
+			}
+		}
+		return ""
+	}
+	if name := dfs(val); name != "" {
+		return "'" + name + "'"
+	}
+	if val.Name() != "" {
+		return "'" + val.Name() + "'"
+	}
+	return fmt.Sprintf("%T", val)
 }
 
 func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
@@ -424,7 +455,6 @@ func applyCallToReturn(call ssa.CallInstruction, fact ssa.Value) []ssa.Value {
 	}
 	return []ssa.Value{fact}
 }
-
 func addPathEdge(worklist *[]PathEdge, P_set map[PathEdge]bool, edge PathEdge) {
 	if !P_set[edge] {
 		P_set[edge] = true
@@ -432,7 +462,6 @@ func addPathEdge(worklist *[]PathEdge, P_set map[PathEdge]bool, edge PathEdge) {
 	}
 }
 func isEntryNode(node ProgramPoint) bool { return node.Index == 0 && node.Block.Index == 0 }
-
 func getPredecessors(p ProgramPoint) []ProgramPoint {
 	if p.Index > 0 {
 		return []ProgramPoint{{Block: p.Block, Index: p.Index - 1}}
@@ -445,7 +474,19 @@ func getPredecessors(p ProgramPoint) []ProgramPoint {
 	}
 	return preds
 }
-
+func getGlobalMockCallers(fn *ssa.Function, allFunctions []*ssa.Function) []ssa.CallInstruction {
+	var callers []ssa.CallInstruction
+	for _, cFn := range allFunctions {
+		for _, b := range cFn.Blocks {
+			for _, inst := range b.Instrs {
+				if callInst, ok := inst.(ssa.CallInstruction); ok && callInst.Common().StaticCallee() == fn {
+					callers = append(callers, callInst)
+				}
+			}
+		}
+	}
+	return callers
+}
 func getInstructionPoint(instr ssa.Instruction) ProgramPoint {
 	b := instr.Block()
 	for i, inst := range b.Instrs {
@@ -454,11 +495,4 @@ func getInstructionPoint(instr ssa.Instruction) ProgramPoint {
 		}
 	}
 	return ProgramPoint{}
-}
-
-func formatVal(v ssa.Value) string {
-	if v.Name() != "" {
-		return "'" + v.Name() + "'"
-	}
-	return fmt.Sprintf("%T", v)
 }
