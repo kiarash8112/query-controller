@@ -17,10 +17,15 @@ import (
 // 1. AST PHASE: Global Loop Context Detection
 // ---------------------------------------------------------
 
+// ---------------------------------------------------------
+// 1. AST PHASE: Loop Context Detection
+// ---------------------------------------------------------
+
 type ASTLoopVisitor struct {
 	fset          *token.FileSet
 	inLoop        bool
-	LoopLocations map[string]string // "Filename:Line" -> "Called Function Name"
+	isExecLoop    bool // NEW: True if the current loop contains an Execution method
+	LoopLocations map[string]string
 }
 
 func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
@@ -29,12 +34,20 @@ func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
 	}
 
 	isLoop := v.inLoop
-	switch n.(type) {
-	case *ast.ForStmt, *ast.RangeStmt:
+	isExecLoop := v.isExecLoop
+
+	// Detect if we are entering a loop
+	switch loopNode := n.(type) {
+	case *ast.ForStmt:
 		isLoop = true
+		isExecLoop = astContainsExecutionMethod(loopNode.Body)
+	case *ast.RangeStmt:
+		isLoop = true
+		isExecLoop = astContainsExecutionMethod(loopNode.Body)
 	}
 
-	if isLoop {
+	// We ONLY flag calls inside the loop if the loop actually EXECUTES a query!
+	if isLoop && isExecLoop {
 		if call, ok := n.(*ast.CallExpr); ok {
 			var name string
 			switch fun := call.Fun.(type) {
@@ -44,14 +57,38 @@ func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
 				name = fun.Sel.Name
 			}
 
-			// BRIDGE SETUP: Use "Filename:Line" to prevent collisions across a large project
 			pos := v.fset.Position(call.Pos())
 			fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
 
 			v.LoopLocations[fileLineKey] = name
 		}
 	}
-	return &ASTLoopVisitor{fset: v.fset, inLoop: isLoop, LoopLocations: v.LoopLocations}
+	return &ASTLoopVisitor{fset: v.fset, inLoop: isLoop, isExecLoop: isExecLoop, LoopLocations: v.LoopLocations}
+}
+
+// HELPER: Scans a loop body to see if it triggers an actual Database Execution
+func astContainsExecutionMethod(node ast.Node) bool {
+	hasExecution := false
+	ast.Inspect(node, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+				// If we see Scan, Find, First, Exec, it's an Execution Loop!
+				switch sel.Sel.Name {
+				case "Scan", "Find", "First", "Take", "Last", "Pluck", "Count", "Exec", "QueryRow", "Query":
+					hasExecution = true
+					return false // Stop searching, we proved it executes!
+				}
+			} else if ident, ok := call.Fun.(*ast.Ident); ok {
+				// If the loop calls a custom Wrapper Function (e.g. fetchTarget()), we assume it executes.
+				if ident.Name != "len" && ident.Name != "append" && ident.Name != "panic" {
+					hasExecution = true
+					return false
+				}
+			}
+		}
+		return true
+	})
+	return hasExecution
 }
 
 // ---------------------------------------------------------
@@ -356,7 +393,9 @@ func getCallName(call *ssa.Call) string {
 
 func getGormFetchArgIndex(methodName string) int {
 	switch methodName {
-	case "Raw", "Not", "Or", "Select", "Find", "First", "Last", "Take", "Scan", "Pluck":
+	// IFDS DATAFLOW SINKS: Which methods handle the malicious inputs?
+	// We brought Where, Not, Or, Select back!
+	case "Where", "Raw", "Not", "Or", "Select":
 		return 1
 	case "Query", "QueryRow", "Exec":
 		return 1
