@@ -14,15 +14,21 @@ import (
 )
 
 // ---------------------------------------------------------
-// 1. AST PHASE: Loop Context Detection (With Executor Map)
+// 1. AST PHASE: Loop Context Detection
 // ---------------------------------------------------------
+
+type LoopContext struct {
+	StartLine int
+	EndLine   int
+}
 
 type ASTLoopVisitor struct {
 	fset          *token.FileSet
 	inLoop        bool
 	isExecLoop    bool
-	Executors     map[string]bool // Knows exactly which wrappers execute!
-	LoopLocations map[string]bool
+	currentCtx    LoopContext
+	Executors     map[string]bool
+	LoopLocations map[string]LoopContext // Filename:Line -> Loop Boundaries
 }
 
 func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
@@ -32,24 +38,43 @@ func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
 
 	isLoop := v.inLoop
 	isExecLoop := v.isExecLoop
+	ctx := v.currentCtx
 
+	// Set boundaries if entering a loop
 	switch loopNode := n.(type) {
 	case *ast.ForStmt:
 		isLoop = true
 		isExecLoop = astContainsExecutionMethod(loopNode.Body, v.Executors)
+		ctx = LoopContext{
+			StartLine: v.fset.Position(loopNode.Pos()).Line,
+			EndLine:   v.fset.Position(loopNode.End()).Line,
+		}
 	case *ast.RangeStmt:
 		isLoop = true
 		isExecLoop = astContainsExecutionMethod(loopNode.Body, v.Executors)
+		ctx = LoopContext{
+			StartLine: v.fset.Position(loopNode.Pos()).Line,
+			EndLine:   v.fset.Position(loopNode.End()).Line,
+		}
 	}
 
-	// HIGHLIGHT ZONE: Mark every single line inside the loop as an "Execution Zone"
+	// HIGHLIGHT ZONE: Mark lines inside Execution loops
 	if isLoop && isExecLoop {
-		pos := v.fset.Position(n.Pos())
-		fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
-		v.LoopLocations[fileLineKey] = true
+		if call, ok := n.(*ast.CallExpr); ok {
+			pos := v.fset.Position(call.Pos())
+			fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
+			v.LoopLocations[fileLineKey] = ctx
+		}
 	}
 
-	return &ASTLoopVisitor{fset: v.fset, inLoop: isLoop, isExecLoop: isExecLoop, Executors: v.Executors, LoopLocations: v.LoopLocations}
+	return &ASTLoopVisitor{
+		fset:          v.fset,
+		inLoop:        isLoop,
+		isExecLoop:    isExecLoop,
+		currentCtx:    ctx,
+		Executors:     v.Executors,
+		LoopLocations: v.LoopLocations,
+	}
 }
 
 func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
@@ -63,7 +88,7 @@ func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
 				name = ident.Name
 			}
 
-			// Does it call a Known Executor OR a Transitive Wrapper?
+			// Call executes if it's a known finisher OR a transitive executor wrapper
 			if isExecutionMethod(name) || executors[name] {
 				hasExecution = true
 				return false
@@ -75,7 +100,7 @@ func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
 }
 
 // ---------------------------------------------------------
-// MAIN EXECUTION
+// MAIN EXECUTION (Project Loader)
 // ---------------------------------------------------------
 
 func main() {
@@ -83,44 +108,60 @@ func main() {
 	if len(os.Args) > 1 {
 		targetDir = os.Args[1]
 	}
-	fmt.Printf(">> LOADING PROJECT: %s\n", targetDir)
+
+	fmt.Printf("\n>> LOADING PROJECT: %s\n", targetDir)
 
 	fset := token.NewFileSet()
 	cfg := &packages.Config{
-		Dir: targetDir, Fset: fset,
+		Dir:  targetDir,
+		Fset: fset,
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
 	}
 
 	initial, err := packages.Load(cfg, "./...")
 	if err != nil {
-		log.Fatalf("Load failed: %v", err)
+		log.Fatalf("Failed to execute package load: %v", err)
 	}
 
-	// Step 1: Build Global SSA First!
+	if packages.PrintErrors(initial) > 0 {
+		fmt.Println("[Warning] Some minor package errors occurred (e.g. CGO bindings), continuing anyway...")
+	}
+
+	// Step 1: Build Global SSA (No SanityCheck flag intentionally)
+	fmt.Println(">> BUILDING GLOBAL SSA DATAFLOW GRAPH...")
 	prog, _ := ssautil.AllPackages(initial, ssa.NaiveForm)
 	prog.Build()
 
+	// Filter down to only user-land functions (ignoring stdlib)
 	allFuncs := getAllFunctions(initial, prog)
 
-	// Step 2: Dynamically calculate which wrappers are Execution functions
+	// Step 2: Calculate which functions are Transitive Executors
 	executors := buildTransitiveExecutors(allFuncs)
 
-	// Step 3: Run AST to map the loops, leveraging the Executor Map!
-	visitor := &ASTLoopVisitor{fset: fset, LoopLocations: make(map[string]bool), Executors: executors}
+	// Step 3: Run AST to map the loops, utilizing Executor context
+	fmt.Println(">> RUNNING AST LOOP SCANNER...")
+	visitor := &ASTLoopVisitor{
+		fset:          fset,
+		LoopLocations: make(map[string]LoopContext),
+		Executors:     executors,
+	}
 	for _, pkg := range initial {
 		for _, file := range pkg.Syntax {
 			ast.Walk(visitor, file)
 		}
 	}
 
-	// Step 4: Run IFDS
+	// Step 4: Run IFDS Tabulation
+	fmt.Println(">> RUNNING IFDS TABULATION ENGINE...")
 	LoopResolutions := Phase1_IFDS_Tabulation(allFuncs, visitor.LoopLocations, fset)
-	Phase2_VerifyNPlusOne(LoopResolutions, visitor.LoopLocations)
+
+	// Step 5: Process Results
+	Phase2_VerifyNPlusOne(LoopResolutions, visitor.LoopLocations, fset)
 }
 
 // ---------------------------------------------------------
-// IFDS PHASE 1: Dataflow Tracing
+// IFDS DATA STRUCTURES
 // ---------------------------------------------------------
 
 type ProgramPoint struct {
@@ -137,32 +178,50 @@ type PathEdge struct {
 }
 type SummaryCache map[*ssa.Function]map[ssa.Value][]ssa.Value
 
-func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopLocations map[string]bool, fset *token.FileSet) map[string][]ssa.Value {
+// ---------------------------------------------------------
+// 2. IFDS PHASE 1: Dataflow Tracing
+// ---------------------------------------------------------
+func isGormFetchMethod(methodName string) bool {
+	switch methodName {
+	// EXPLICIT WHITELIST: Fetch APIs only.
+	// We intentionally leave OUT 'Exec', 'Create', 'Delete', 'Update' so they get ignored!
+	case "Where", "Raw", "Not", "Or", "Select":
+		return true
+	case "Query", "QueryRow":
+		return true
+	}
+	return false
+}
+
+func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopLocations map[string]LoopContext, fset *token.FileSet) map[string][]ssa.Value {
 	P_set := make(map[PathEdge]bool)
 	var worklist []PathEdge
 	summaries := make(SummaryCache)
 	LoopResolutions := make(map[string][]ssa.Value)
-
 	// SINK FINDER
 	for _, fn := range allFunctions {
 		for _, block := range fn.Blocks {
 			for i, instr := range block.Instrs {
 				if call, ok := instr.(*ssa.Call); ok {
 					methodName := getCallNameFromInstr(call)
-					sinkIndex := getGormFetchArgIndex(methodName)
 
-					if sinkIndex != -1 && len(call.Common().Args) > sinkIndex {
-						val := call.Common().Args[sinkIndex]
+					// If it is a GORM Fetch...
+					if isGormFetchMethod(methodName) {
 
-						pos := fset.Position(call.Pos())
-						fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
+						// LOOP through ALL arguments (skipping arg 0 which is the 'db' receiver)
+						for argIdx := 1; argIdx < len(call.Common().Args); argIdx++ {
+							val := call.Common().Args[argIdx]
 
-						if loopLocations[fileLineKey] {
-							LoopResolutions[fileLineKey] = append(LoopResolutions[fileLineKey], val)
+							pos := fset.Position(call.Pos())
+							fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
+
+							if loopLocations[fileLineKey].StartLine > 0 {
+								LoopResolutions[fileLineKey] = append(LoopResolutions[fileLineKey], val)
+							}
+
+							seed := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
+							addPathEdge(&worklist, P_set, PathEdge{Start: seed, End: seed})
 						}
-
-						seed := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
-						addPathEdge(&worklist, P_set, PathEdge{Start: seed, End: seed})
 					}
 				}
 			}
@@ -214,13 +273,17 @@ func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopLocations map[stri
 						pos := fset.Position(caller.Pos())
 						fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
 
-						if loopLocations[fileLineKey] {
+						// BRIDGE 2: Transitive Return traps wrapper loops
+						if loopLocations[fileLineKey].StartLine > 0 {
 							LoopResolutions[fileLineKey] = append(LoopResolutions[fileLineKey], arg)
 						}
 
 						callerPoint := getInstructionPoint(caller)
 						for _, prevPoint := range getPredecessors(callerPoint) {
-							addPathEdge(&worklist, P_set, PathEdge{Start: ExplodedNode{Point: prevPoint, Fact: arg}, End: ExplodedNode{Point: prevPoint, Fact: arg}})
+							addPathEdge(&worklist, P_set, PathEdge{
+								Start: ExplodedNode{Point: prevPoint, Fact: arg},
+								End:   ExplodedNode{Point: prevPoint, Fact: arg},
+							})
 						}
 					}
 				}
@@ -237,10 +300,10 @@ func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopLocations map[stri
 }
 
 // ---------------------------------------------------------
-// PHASE 2 & LOGIC UTILITIES
+// 3. PHASE 2: Lookup and False Positive Validation
 // ---------------------------------------------------------
 
-func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value, LoopLocations map[string]bool) {
+func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value, LoopLocations map[string]LoopContext, fset *token.FileSet) {
 	fmt.Println("\n==========================================")
 	fmt.Println(">> PHASE 2: GORM N+1 VULNERABILITY REPORT")
 	fmt.Println("==========================================")
@@ -253,33 +316,153 @@ func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value, LoopLocations
 	vulnsFound := 0
 
 	for locationKey, resolvedArgs := range LoopResolutions {
-		isDynamicVariable := false
-		var dynamicVal ssa.Value
+		loopCtx := LoopLocations[locationKey]
 
 		for _, arg := range resolvedArgs {
-			if _, isConst := arg.(*ssa.Const); !isConst {
-				isDynamicVariable = true
-				dynamicVal = arg
+			// Ignore constants entirely
+			if _, isConst := arg.(*ssa.Const); isConst {
+				continue
 			}
-		}
 
-		if isDynamicVariable {
+			// 1. Get the root variable and its exact source line
+			rootVar := getRootVariable(arg)
+			varLine := fset.Position(rootVar.Pos()).Line
+
+			// 2. STATE POLLING CHECK
+			// If variable was created before the loop started, it's just Polling/Status Checking!
+			if varLine > 0 && varLine < loopCtx.StartLine {
+				// (Optional: You can uncomment this if you want to see State Polling reported)
+				// fmt.Printf(" ✅ [STATE POLLING] \t%s \n\t-> Variable '%s' was defined outside the loop (Line %d).\n\n",
+				//	locationKey, resolveHumanName(arg), varLine)
+				continue
+			}
+
+			// 3. TRUE N+1
 			vulnsFound++
-			humanName := resolveHumanName(dynamicVal)
-			fmt.Printf(" 🚨 [TRUE N+1] \t%s \n\t-> Loop dynamically fetches using variable: %s\n\n", locationKey, humanName)
+			humanName := resolveHumanName(arg)
+			fmt.Printf(" 🚨 [TRUE N+1] \t%s \n\t-> Loop dynamically fetches using iteration variable %s\n\n", locationKey, humanName)
 		}
 	}
 
 	if vulnsFound == 0 {
-		fmt.Println(" ✅ Project Clean! All loops use safe, hardcoded static queries.")
+		fmt.Println(" ✅ Project Clean! All loops use safe state polling or hardcoded queries.")
 	}
 }
 
-// Builds the list of functions that transitively trigger DB network requests.
+// ============================================================================
+// STATE POLLING & VARIABLE RESOLUTION
+// ============================================================================
+
+// Recursively walks back registers to find the exact line
+// the variable was instantiated (to combat State Polling)
+func getRootVariable(val ssa.Value) ssa.Value {
+	visited := make(map[ssa.Value]bool)
+	var dfs func(v ssa.Value) ssa.Value
+	dfs = func(v ssa.Value) ssa.Value {
+		if v == nil || visited[v] {
+			return v
+		}
+		visited[v] = true
+
+		if _, ok := v.(*ssa.Alloc); ok {
+			return v
+		}
+		if _, ok := v.(*ssa.Parameter); ok {
+			return v
+		}
+		if _, ok := v.(*ssa.Global); ok {
+			return v
+		}
+		if _, ok := v.(*ssa.FreeVar); ok {
+			return v
+		}
+		if _, ok := v.(*ssa.Const); ok {
+			return v
+		}
+
+		switch x := v.(type) {
+		case *ssa.MakeInterface:
+			return dfs(x.X)
+		case *ssa.ChangeType:
+			return dfs(x.X)
+		case *ssa.Slice:
+			return dfs(x.X)
+		case *ssa.UnOp:
+			return dfs(x.X)
+		case *ssa.Extract:
+			return dfs(x.Tuple)
+		case *ssa.FieldAddr:
+			return dfs(x.X)
+		case *ssa.IndexAddr:
+			return dfs(x.X)
+		}
+		return v
+	}
+	return dfs(val)
+}
+
+func resolveHumanName(val ssa.Value) string {
+	visited := make(map[ssa.Value]bool)
+	var dfs func(v ssa.Value) string
+	dfs = func(v ssa.Value) string {
+		if v == nil || visited[v] {
+			return ""
+		}
+		visited[v] = true
+
+		if alloc, ok := v.(*ssa.Alloc); ok && alloc.Comment != "" {
+			return alloc.Comment
+		}
+		if param, ok := v.(*ssa.Parameter); ok && param.Name() != "" {
+			return param.Name()
+		}
+		if global, ok := v.(*ssa.Global); ok && global.Name() != "" {
+			return global.Name()
+		}
+		if fv, ok := v.(*ssa.FreeVar); ok && fv.Name() != "" {
+			return fv.Name()
+		}
+
+		switch x := v.(type) {
+		case *ssa.MakeInterface:
+			return dfs(x.X)
+		case *ssa.ChangeType:
+			return dfs(x.X)
+		case *ssa.Slice:
+			return dfs(x.X)
+		case *ssa.UnOp:
+			return dfs(x.X)
+		case *ssa.Extract:
+			return dfs(x.Tuple)
+		case *ssa.FieldAddr:
+			if res := dfs(x.X); res != "" {
+				return res + " (struct field)"
+			}
+		case *ssa.IndexAddr:
+			if res := dfs(x.X); res != "" {
+				return res + " (slice item)"
+			}
+		}
+		return ""
+	}
+
+	if name := dfs(val); name != "" {
+		return "'" + name + "'"
+	}
+	if val.Name() != "" {
+		return "'" + val.Name() + "'"
+	}
+	return fmt.Sprintf("%T", val)
+}
+
+// ============================================================================
+// GLOBAL PROJECT LOGIC AND SINK FINDERS
+// ============================================================================
+
 func buildTransitiveExecutors(funcs []*ssa.Function) map[string]bool {
 	execMap := make(map[*ssa.Function]bool)
 
-	// 1. Direct Executors (Scan, Find, Query)
+	// Base Execution Methods
 	for _, fn := range funcs {
 		for _, b := range fn.Blocks {
 			for _, instr := range b.Instrs {
@@ -290,7 +473,7 @@ func buildTransitiveExecutors(funcs []*ssa.Function) map[string]bool {
 		}
 	}
 
-	// 2. Transitive Executors (Wrappers calling Executors)
+	// Wrapper Propagation
 	changed := true
 	for changed {
 		changed = false
@@ -318,7 +501,6 @@ func buildTransitiveExecutors(funcs []*ssa.Function) map[string]bool {
 	return names
 }
 
-// Filters out unneeded Standard Library dependencies directly
 func getAllFunctions(initial []*packages.Package, prog *ssa.Program) []*ssa.Function {
 	var funcs []*ssa.Function
 	userPkgs := make(map[*types.Package]bool)
@@ -383,57 +565,6 @@ func getGormFetchArgIndex(methodName string) int {
 	return -1
 }
 
-func resolveHumanName(val ssa.Value) string {
-	visited := make(map[ssa.Value]bool)
-	var dfs func(v ssa.Value) string
-	dfs = func(v ssa.Value) string {
-		if v == nil || visited[v] {
-			return ""
-		}
-		visited[v] = true
-		if alloc, ok := v.(*ssa.Alloc); ok && alloc.Comment != "" {
-			return alloc.Comment
-		}
-		if param, ok := v.(*ssa.Parameter); ok && param.Name() != "" {
-			return param.Name()
-		}
-		if global, ok := v.(*ssa.Global); ok && global.Name() != "" {
-			return global.Name()
-		}
-		if fv, ok := v.(*ssa.FreeVar); ok && fv.Name() != "" {
-			return fv.Name()
-		}
-		switch x := v.(type) {
-		case *ssa.MakeInterface:
-			return dfs(x.X)
-		case *ssa.ChangeType:
-			return dfs(x.X)
-		case *ssa.Slice:
-			return dfs(x.X)
-		case *ssa.UnOp:
-			return dfs(x.X)
-		case *ssa.Extract:
-			return dfs(x.Tuple)
-		case *ssa.FieldAddr:
-			if res := dfs(x.X); res != "" {
-				return res + " (struct field)"
-			}
-		case *ssa.IndexAddr:
-			if res := dfs(x.X); res != "" {
-				return res + " (slice item)"
-			}
-		}
-		return ""
-	}
-	if name := dfs(val); name != "" {
-		return "'" + name + "'"
-	}
-	if val.Name() != "" {
-		return "'" + val.Name() + "'"
-	}
-	return fmt.Sprintf("%T", val)
-}
-
 func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
 	if instrVal, ok := instr.(ssa.Value); ok && instrVal == d2 {
 		var newFacts []ssa.Value
@@ -455,13 +586,18 @@ func applyCallToReturn(call ssa.CallInstruction, fact ssa.Value) []ssa.Value {
 	}
 	return []ssa.Value{fact}
 }
+
 func addPathEdge(worklist *[]PathEdge, P_set map[PathEdge]bool, edge PathEdge) {
 	if !P_set[edge] {
 		P_set[edge] = true
 		*worklist = append(*worklist, edge)
 	}
 }
-func isEntryNode(node ProgramPoint) bool { return node.Index == 0 && node.Block.Index == 0 }
+
+func isEntryNode(node ProgramPoint) bool {
+	return node.Index == 0 && node.Block.Index == 0
+}
+
 func getPredecessors(p ProgramPoint) []ProgramPoint {
 	if p.Index > 0 {
 		return []ProgramPoint{{Block: p.Block, Index: p.Index - 1}}
@@ -474,6 +610,7 @@ func getPredecessors(p ProgramPoint) []ProgramPoint {
 	}
 	return preds
 }
+
 func getGlobalMockCallers(fn *ssa.Function, allFunctions []*ssa.Function) []ssa.CallInstruction {
 	var callers []ssa.CallInstruction
 	for _, cFn := range allFunctions {
@@ -487,6 +624,7 @@ func getGlobalMockCallers(fn *ssa.Function, allFunctions []*ssa.Function) []ssa.
 	}
 	return callers
 }
+
 func getInstructionPoint(instr ssa.Instruction) ProgramPoint {
 	b := instr.Block()
 	for i, inst := range b.Instrs {

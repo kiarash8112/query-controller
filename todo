@@ -1,3 +1,4 @@
 1. in actual ifds there is . fact that is allways reachable but in code we dont have it
 2. improve finding sinks (gorm.scan, rawqueries)
 3. support embeded
+4. cannot handle general market
