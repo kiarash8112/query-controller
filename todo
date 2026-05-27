@@ -2,3 +2,28 @@
 2. improve finding sinks (gorm.scan, rawqueries)
 3. support embeded
 4. cannot handle general market
+
+
+
+do we need getAllFunctions cant we just read all files ?
+what happend if we first see excecuter inside loop but dont mark it and after that see the executer and then mark it ?
+how select in gorm fetch method can root in query n+1 problem
+Fact: ret.Results[0] why we count on first resut?
+why we dont use summeries any more in call flow
+in second phase we shouldnt just search for path of sinks beacuse if we have some thing like
+
+for _,strId := range userids{
+    id := convert(convert(strid))
+    fetchuser(id)
+}
+
+the convert function defition is outof scope of loop
+ ?
+
+
+
+ else if store, ok := instr.(*ssa.Store); ok && store.Addr == d2 {
+		return []ssa.Value{store.Val}
+	}
+
+here we check address shouldnt we check value ?
