@@ -14,18 +14,15 @@ import (
 )
 
 // ---------------------------------------------------------
-// 1. AST PHASE: Loop Context Detection & Bounding Boxes
+// 1. AST PHASE: Loop Context Detection (With Executor Map)
 // ---------------------------------------------------------
-
-type LoopContext struct {
-	StartLine int
-	EndLine   int
-}
 
 type ASTLoopVisitor struct {
 	fset          *token.FileSet
+	inLoop        bool
+	isExecLoop    bool
 	Executors     map[string]bool
-	LoopLocations map[string][]LoopContext
+	LoopLocations map[string]bool
 }
 
 func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
@@ -33,29 +30,47 @@ func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
 		return nil
 	}
 
+	isLoop := v.inLoop
+	isExecLoop := v.isExecLoop
+
 	switch loopNode := n.(type) {
-	case *ast.ForStmt, *ast.RangeStmt:
-		var loopBody ast.Node
-		if f, ok := loopNode.(*ast.ForStmt); ok {
-			loopBody = f.Body
-		}
-		if r, ok := loopNode.(*ast.RangeStmt); ok {
-			loopBody = r.Body
-		}
-
-		if astContainsExecutionMethod(loopBody, v.Executors) {
-			startPos := v.fset.Position(loopNode.Pos())
-			endPos := v.fset.Position(loopNode.End())
-
-			box := LoopContext{
-				StartLine: startPos.Line,
-				EndLine:   endPos.Line,
-			}
-			v.LoopLocations[startPos.Filename] = append(v.LoopLocations[startPos.Filename], box)
-		}
+	case *ast.ForStmt:
+		isLoop = true
+		isExecLoop = astContainsExecutionMethod(loopNode.Body, v.Executors)
+	case *ast.RangeStmt:
+		isLoop = true
+		isExecLoop = astContainsExecutionMethod(loopNode.Body, v.Executors)
 	}
 
-	return v
+	// Original behavior: mark every AST child node's line
+	if isLoop && isExecLoop {
+		pos := v.fset.Position(n.Pos())
+		fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
+		v.LoopLocations[fileLineKey] = true
+	}
+
+	return &ASTLoopVisitor{
+		fset:          v.fset,
+		inLoop:        isLoop,
+		isExecLoop:    isExecLoop,
+		Executors:     v.Executors,
+		LoopLocations: v.LoopLocations,
+	}
+}
+
+// markLoopLines marks every line from startPos to endPos in LoopLocations.
+// FIX #2: Instead of marking arbitrary AST child nodes, we mark the full
+// line range of the loop so multi-line calls are always covered.
+func markLoopLines(fset *token.FileSet, startPos, endPos token.Pos, loopLocations map[string]bool) {
+	start := fset.Position(startPos)
+	end := fset.Position(endPos)
+	if !start.IsValid() || !end.IsValid() {
+		return
+	}
+	for line := start.Line; line <= end.Line; line++ {
+		key := fmt.Sprintf("%s:%d", start.Filename, line)
+		loopLocations[key] = true
+	}
 }
 
 func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
@@ -68,6 +83,11 @@ func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
 			} else if ident, ok := call.Fun.(*ast.Ident); ok {
 				name = ident.Name
 			}
+
+			if name == "DeletePartIteration" {
+				fmt.Println("fuck")
+			}
+
 			if isExecutionMethod(name) || executors[name] {
 				hasExecution = true
 				return false
@@ -79,43 +99,43 @@ func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
 }
 
 // ---------------------------------------------------------
-// MAIN EXECUTION (Project Loader)
+// MAIN EXECUTION
 // ---------------------------------------------------------
 
 func main() {
-	targetDir := "examples/example1/"
+	targetDir := "/home/user/Desktop/dzfg/test/general-market/logistics/"
 	if len(os.Args) > 1 {
 		targetDir = os.Args[1]
 	}
-	fmt.Printf("\n>> LOADING PROJECT: %s\n", targetDir)
+	fmt.Printf(">> LOADING PROJECT: %s\n", targetDir)
 
 	fset := token.NewFileSet()
+
 	cfg := &packages.Config{
-		Dir:  targetDir,
 		Fset: fset,
+		Dir:  targetDir,
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
 	}
 
 	initial, err := packages.Load(cfg, "./...")
 	if err != nil {
-		log.Fatalf("Failed to execute package load: %v", err)
-	}
-	if packages.PrintErrors(initial) > 0 {
-		fmt.Println("[Warning] Minor package errors occurred, continuing analysis...")
+		log.Fatalf("Load failed: %v", err)
 	}
 
-	fmt.Println(">> BUILDING GLOBAL SSA DATAFLOW GRAPH...")
+	// Step 1: Build Global SSA
 	prog, _ := ssautil.AllPackages(initial, ssa.NaiveForm)
 	prog.Build()
 
 	allFuncs := getAllFunctions(initial, prog)
+
+	// Step 2: Dynamically calculate which wrappers are Execution functions
 	executors := buildTransitiveExecutors(allFuncs)
 
-	fmt.Println(">> RUNNING AST LOOP SCANNER...")
+	// Step 3: Run AST to map the loops, leveraging the Executor Map
 	visitor := &ASTLoopVisitor{
-		fset:          fset,
-		LoopLocations: make(map[string][]LoopContext),
+		fset:          prog.Fset,
+		LoopLocations: make(map[string]bool),
 		Executors:     executors,
 	}
 	for _, pkg := range initial {
@@ -124,63 +144,78 @@ func main() {
 		}
 	}
 
-	fmt.Println(">> RUNNING IFDS TABULATION ENGINE...")
-	P_set := Phase1_IFDS_Tabulation(allFuncs, visitor.LoopLocations, fset)
-
-	Phase2_VerifyNPlusOne(P_set, visitor.LoopLocations, fset)
+	// FIX #1: Pass prog.Fset (SSA's FileSet) to Phase1 so SSA token
+	// positions are decoded correctly instead of using the AST fset.
+	LoopResolutions := Phase1_IFDS_Tabulation(allFuncs, visitor.LoopLocations, prog.Fset)
+	Phase2_VerifyNPlusOne(LoopResolutions, visitor.LoopLocations)
 }
 
 // ---------------------------------------------------------
-// IFDS DATA STRUCTURES
+// IFDS PHASE 1: Dataflow Tracing
 // ---------------------------------------------------------
 
 type ProgramPoint struct {
 	Block *ssa.BasicBlock
 	Index int
 }
-
 type ExplodedNode struct {
 	Point ProgramPoint
 	Fact  ssa.Value
 }
-
+type PathEdge struct {
+	Start ExplodedNode
+	End   ExplodedNode
+}
 type SummaryCache map[*ssa.Function]map[ssa.Value][]ssa.Value
 
-type PathEdge struct {
-	Start      ExplodedNode
-	End        ExplodedNode
-	OriginLoop string
-}
-
-// ---------------------------------------------------------
-// 2. IFDS PHASE 1: Dataflow Tracing
-// ---------------------------------------------------------
-
-func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopLocations map[string][]LoopContext, fset *token.FileSet) map[PathEdge]bool {
+func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopLocations map[string]bool, ssaFset *token.FileSet) map[string][]ssa.Value {
 	P_set := make(map[PathEdge]bool)
 	var worklist []PathEdge
 	summaries := make(SummaryCache)
+	LoopResolutions := make(map[string][]ssa.Value)
 
-	// SINK FINDER: Seed worklist from GORM query call sites
+	// SINK FINDER
+	// SINK FINDER
 	for _, fn := range allFunctions {
+
+		// FIX 1: Skip synthetic functions generated by the compiler.
+		// Their internal calls have bogus/invalid token.Pos() leading to wrong file/line paths.
+		if fn.Synthetic != "" {
+			continue
+		}
+
 		for _, block := range fn.Blocks {
 			for i, instr := range block.Instrs {
-				if call, ok := instr.(*ssa.Call); ok {
+
+				// FIX 2: Use ssa.CallInstruction instead of *ssa.Call.
+				// This allows you to catch Interface method calls (*ssa.Invoke) alongside normal calls.
+				if call, ok := instr.(ssa.CallInstruction); ok {
 					methodName := getCallNameFromInstr(call)
-					if isGormFetchCondtion(methodName) {
-						for argIdx := 1; argIdx < len(call.Common().Args); argIdx++ {
-							val := call.Common().Args[argIdx]
+					sinkIndex := getGormFetchArgIndex(methodName)
 
-							p := ProgramPoint{Block: block, Index: i}
-							tag := getLoopTag("", p, fset, loopLocations)
+					// Temporary override so your debug print gets picked up
+					if methodName == "DeletePartIteration" {
+						fmt.Println("Found DeletePartIteration!")
+					}
 
-							seed := ExplodedNode{Point: p, Fact: val}
-							addPathEdge(&worklist, P_set, PathEdge{
-								Start:      seed,
-								End:        seed,
-								OriginLoop: tag,
-							})
+					if sinkIndex != -1 && len(call.Common().Args) > sinkIndex {
+						val := call.Common().Args[sinkIndex]
+
+						pos := ssaFset.Position(call.Pos())
+
+						// FIX 4: Safety checking. Skip invalid positions that don't map to real code
+						if !pos.IsValid() {
+							continue
 						}
+
+						fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
+
+						if loopLocations[fileLineKey] {
+							LoopResolutions[fileLineKey] = append(LoopResolutions[fileLineKey], val)
+						}
+
+						sink := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
+						addPathEdge(&worklist, P_set, PathEdge{Start: sink, End: sink})
 					}
 				}
 			}
@@ -194,381 +229,110 @@ func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopLocations map[stri
 
 		v2 := edge.End.Point
 		d2 := edge.End.Fact
-
-		if v2.Block == nil || v2.Index >= len(v2.Block.Instrs) {
-			continue
-		}
-
 		instr := v2.Block.Instrs[v2.Index]
 
 		if callInstr, ok := instr.(ssa.CallInstruction); ok {
-
-			// Resolve Extract Index for Multi-Return Functions
-			trackIndex := 0
-			if callVal, isVal := callInstr.(ssa.Value); isVal {
-				if referrers := callVal.Referrers(); referrers != nil {
-					for _, ref := range *referrers {
-						if extract, isExtract := ref.(*ssa.Extract); isExtract && extract == d2 {
-							trackIndex = extract.Index
-						}
-					}
-				}
-			}
-
-			// A. DIVE INTO METHOD (CallFlow)
-			if callVal, ok := callInstr.(ssa.Value); ok && (callVal == d2 || callVal.Type().Underlying().String() == "tuple") {
+			if callVal, ok := callInstr.(ssa.Value); ok && callVal == d2 {
 				callee := callInstr.Common().StaticCallee()
 				if callee != nil {
-
-					// SUMMARY CACHE CHECK
-					// FIX: key must be edge.Start.Fact (the original sink-side seed),
-					//      matching what was stored when isEntryNode was reached.
-					summaryUsed := false
-					if cachedResults, exists := summaries[callee][edge.Start.Fact]; exists {
-						for _, paramD2 := range cachedResults {
-							for i, param := range callee.Params {
-								if param == paramD2 {
-									arg := callInstr.Common().Args[i]
-									for _, prevPoint := range getPredecessors(v2) {
-										newTag := getLoopTag(edge.OriginLoop, prevPoint, fset, loopLocations)
-										addPathEdge(&worklist, P_set, PathEdge{
-											Start:      edge.Start,
-											End:        ExplodedNode{Point: prevPoint, Fact: arg},
-											OriginLoop: newTag,
-										})
-									}
-								}
-							}
-						}
-						summaryUsed = true
-					}
-
-					// FUNCTION DIVE
-					if !summaryUsed {
-						for _, block := range callee.Blocks {
-							for i, retInstr := range block.Instrs {
-								if ret, ok := retInstr.(*ssa.Return); ok {
-									safeIndex := trackIndex
-									if safeIndex >= len(ret.Results) {
-										safeIndex = 0
-									}
-
-									retPoint := ProgramPoint{Block: block, Index: i}
-									retFact := ret.Results[safeIndex]
-
-									// FIX: Preserve edge.Start across the callee boundary.
-									//      Only edge.End moves into the callee body.
-									//      This ensures that when kill/gen reaches isEntryNode,
-									//      edge.Start.Fact is the original call-site seed,
-									//      giving the summary cache the correct key.
-									addPathEdge(&worklist, P_set, PathEdge{
-										Start:      edge.Start,
-										End:        ExplodedNode{Point: retPoint, Fact: retFact},
-										OriginLoop: edge.OriginLoop,
-									})
-								}
+					for _, block := range callee.Blocks {
+						for i, retInstr := range block.Instrs {
+							if ret, ok := retInstr.(*ssa.Return); ok {
+								newCtx := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: ret.Results[0]}
+								addPathEdge(&worklist, P_set, PathEdge{Start: newCtx, End: newCtx})
 							}
 						}
 					}
 				}
 			} else {
-				// B. BYPASS FUNCTION (CallToReturn)
-				for _, nd2 := range byPassFunction(callInstr, d2) {
+				for _, nd2 := range applyCallToReturn(callInstr, d2) {
 					for _, prevPoint := range getPredecessors(v2) {
-						newTag := getLoopTag(edge.OriginLoop, prevPoint, fset, loopLocations)
-						addPathEdge(&worklist, P_set, PathEdge{
-							Start:      edge.Start,
-							End:        ExplodedNode{Point: prevPoint, Fact: nd2},
-							OriginLoop: newTag,
-						})
+						addPathEdge(&worklist, P_set, PathEdge{Start: edge.Start, End: ExplodedNode{Point: prevPoint, Fact: nd2}})
 					}
 				}
 			}
-
 		} else if isEntryNode(v2) {
-			// C. EXIT FUNCTION (ReturnFlow)
-			// At the entry node of the callee, d1=edge.Start.Fact is the
-			// original call-site seed, d2 is the callee param we traced to.
-			// This is the correct summary key because we preserved Start above.
 			fn := v2.Block.Parent()
 			for paramIdx, param := range fn.Params {
 				if param == d2 {
 					d1 := edge.Start.Fact
-
 					if summaries[fn] == nil {
 						summaries[fn] = make(map[ssa.Value][]ssa.Value)
 					}
 					summaries[fn][d1] = append(summaries[fn][d1], d2)
 
 					for _, caller := range getGlobalMockCallers(fn, allFunctions) {
-						if paramIdx >= len(caller.Common().Args) {
-							continue
-						}
 						arg := caller.Common().Args[paramIdx]
+
+						// FIX #1: Use ssaFset here too
+						pos := ssaFset.Position(caller.Pos())
+						fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
+
+						if loopLocations[fileLineKey] {
+							LoopResolutions[fileLineKey] = append(LoopResolutions[fileLineKey], arg)
+						}
+
 						callerPoint := getInstructionPoint(caller)
 						for _, prevPoint := range getPredecessors(callerPoint) {
-							newTag := getLoopTag(edge.OriginLoop, prevPoint, fset, loopLocations)
 							addPathEdge(&worklist, P_set, PathEdge{
-								Start:      ExplodedNode{Point: prevPoint, Fact: arg},
-								End:        ExplodedNode{Point: prevPoint, Fact: arg},
-								OriginLoop: newTag,
+								Start: ExplodedNode{Point: prevPoint, Fact: arg},
+								End:   ExplodedNode{Point: prevPoint, Fact: arg},
 							})
 						}
 					}
 				}
 			}
-
 		} else {
-			// D. STANDARD FLOW (Kill/Gen)
 			for _, nd2 := range applyNormalFlow(instr, d2) {
 				for _, prevPoint := range getPredecessors(v2) {
-					newTag := getLoopTag(edge.OriginLoop, prevPoint, fset, loopLocations)
-					addPathEdge(&worklist, P_set, PathEdge{
-						Start:      edge.Start,
-						End:        ExplodedNode{Point: prevPoint, Fact: nd2},
-						OriginLoop: newTag,
-					})
+					addPathEdge(&worklist, P_set, PathEdge{Start: edge.Start, End: ExplodedNode{Point: prevPoint, Fact: nd2}})
 				}
 			}
 		}
 	}
-
-	return P_set
+	return LoopResolutions
 }
 
 // ---------------------------------------------------------
-// 3. PHASE 2: Lookup and False Positive Validation
+// PHASE 2 & LOGIC UTILITIES
 // ---------------------------------------------------------
 
-func Phase2_VerifyNPlusOne(P_set map[PathEdge]bool, loopLocs map[string][]LoopContext, fset *token.FileSet) {
+func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value, LoopLocations map[string]bool) {
 	fmt.Println("\n==========================================")
 	fmt.Println(">> PHASE 2: GORM N+1 VULNERABILITY REPORT")
 	fmt.Println("==========================================")
 
-	LoopTerminals := make(map[string][]ssa.Value)
-	dedup := make(map[string]map[ssa.Value]bool)
-
-	for edge := range P_set {
-		if edge.OriginLoop == "" {
-			continue
-		}
-		fact := edge.End.Fact
-
-		switch fact.(type) {
-		case *ssa.Const, *ssa.Alloc, *ssa.Parameter, *ssa.Global, *ssa.FreeVar:
-			if dedup[edge.OriginLoop] == nil {
-				dedup[edge.OriginLoop] = make(map[ssa.Value]bool)
-			}
-			if !dedup[edge.OriginLoop][fact] {
-				dedup[edge.OriginLoop][fact] = true
-				LoopTerminals[edge.OriginLoop] = append(LoopTerminals[edge.OriginLoop], fact)
-			}
-		}
-	}
-
-	if len(LoopTerminals) == 0 {
-		fmt.Println(" ✅ Project Clean! No N+1 Queries detected in loops.")
+	if len(LoopResolutions) == 0 {
+		fmt.Println(" ✅ Project Clean! No N+1 Queries detected.")
 		return
 	}
 
 	vulnsFound := 0
-	for locationKey, roots := range LoopTerminals {
-		isDynamicVariable := false
-		var dynamicVal ssa.Value
-		var constVal string
 
-		for _, root := range roots {
-			if c, isConst := root.(*ssa.Const); isConst {
-				if c.Value == nil {
-					constVal = "nil"
-				} else {
-					constVal = c.Value.ExactString()
-				}
-			} else {
+	for locationKey, resolvedArgs := range LoopResolutions {
+		isDynamicVariable := false
+
+		for _, arg := range resolvedArgs {
+			if _, isConst := arg.(*ssa.Const); !isConst {
 				isDynamicVariable = true
-				dynamicVal = root
 			}
 		}
 
-		if !isDynamicVariable {
-			fmt.Printf(" ✅ [SAFE] \t%s \n\t-> Safe Static Dataflow: %s\n\n", locationKey, constVal)
-		} else {
-			var varLine int
-			if dynamicVal != nil {
-				rootVar := getRootVariable(dynamicVal)
-				if rootVar != nil {
-					varLine = fset.Position(rootVar.Pos()).Line
-				}
-			}
-
-			var boundCtx *LoopContext
-			for filename, boxes := range loopLocs {
-				for _, box := range boxes {
-					if fmt.Sprintf("%s:%d", filename, box.StartLine) == locationKey {
-						boundCtx = &box
-					}
-				}
-			}
-
-			if boundCtx != nil && varLine > 0 && varLine < boundCtx.StartLine {
-				continue
-			}
-
+		if isDynamicVariable {
 			vulnsFound++
 			fmt.Printf(" 🚨 [TRUE N+1] \t%s \n\t", locationKey)
 		}
 	}
 
 	if vulnsFound == 0 {
-		fmt.Println(" ✅ Project Clean! All loops use state polling or static queries.")
+		fmt.Println(" ✅ Project Clean! All loops use safe, hardcoded static queries.")
 	}
 }
-
-// ============================================================================
-// LOGIC UTILITIES & TAGGING
-// ============================================================================
-
-func getLoopTag(currentTag string, p ProgramPoint, fset *token.FileSet, locs map[string][]LoopContext) string {
-	if currentTag != "" {
-		return currentTag
-	}
-
-	if p.Block == nil || len(p.Block.Instrs) == 0 {
-		return ""
-	}
-	idx := p.Index
-	if idx >= len(p.Block.Instrs) {
-		idx = len(p.Block.Instrs) - 1
-	}
-
-	pos := fset.Position(p.Block.Instrs[idx].Pos())
-	if ctx := isInsideLoop(pos.Filename, pos.Line, locs); ctx != nil {
-		return fmt.Sprintf("%s:%d", pos.Filename, ctx.StartLine)
-	}
-	return ""
-}
-
-func isInsideLoop(filename string, line int, loopLocations map[string][]LoopContext) *LoopContext {
-	boxes := loopLocations[filename]
-	for _, box := range boxes {
-		if line >= box.StartLine && line <= box.EndLine {
-			return &box
-		}
-	}
-	return nil
-}
-
-func getRootVariable(val ssa.Value) ssa.Value {
-	visited := make(map[ssa.Value]bool)
-	var dfs func(v ssa.Value) ssa.Value
-	dfs = func(v ssa.Value) ssa.Value {
-		if v == nil || visited[v] {
-			return v
-		}
-		visited[v] = true
-
-		if _, ok := v.(*ssa.Alloc); ok {
-			return v
-		}
-		if _, ok := v.(*ssa.Parameter); ok {
-			return v
-		}
-		if _, ok := v.(*ssa.Global); ok {
-			return v
-		}
-		if _, ok := v.(*ssa.FreeVar); ok {
-			return v
-		}
-		if _, ok := v.(*ssa.Const); ok {
-			return v
-		}
-
-		switch x := v.(type) {
-		case *ssa.MakeInterface:
-			return dfs(x.X)
-		case *ssa.ChangeType:
-			return dfs(x.X)
-		case *ssa.Slice:
-			return dfs(x.X)
-		case *ssa.UnOp:
-			return dfs(x.X)
-		case *ssa.Extract:
-			return dfs(x.Tuple)
-		case *ssa.FieldAddr:
-			return dfs(x.X)
-		case *ssa.IndexAddr:
-			return dfs(x.X)
-		}
-		return v
-	}
-	return dfs(val)
-}
-
-func resolveHumanName(val ssa.Value) string {
-	if val == nil {
-		return "'unresolved_nil'"
-	}
-
-	visited := make(map[ssa.Value]bool)
-	var dfs func(v ssa.Value) string
-	dfs = func(v ssa.Value) string {
-		if v == nil || visited[v] {
-			return ""
-		}
-		visited[v] = true
-
-		if alloc, ok := v.(*ssa.Alloc); ok && alloc.Comment != "" {
-			return alloc.Comment
-		}
-		if param, ok := v.(*ssa.Parameter); ok && param.Name() != "" {
-			return param.Name()
-		}
-		if global, ok := v.(*ssa.Global); ok && global.Name() != "" {
-			return global.Name()
-		}
-		if fv, ok := v.(*ssa.FreeVar); ok && fv.Name() != "" {
-			return fv.Name()
-		}
-
-		switch x := v.(type) {
-		case *ssa.MakeInterface:
-			return dfs(x.X)
-		case *ssa.ChangeType:
-			return dfs(x.X)
-		case *ssa.Slice:
-			return dfs(x.X)
-		case *ssa.UnOp:
-			return dfs(x.X)
-		case *ssa.Extract:
-			return dfs(x.Tuple)
-		case *ssa.FieldAddr:
-			if res := dfs(x.X); res != "" {
-				return res + " (struct field)"
-			}
-		case *ssa.IndexAddr:
-			if res := dfs(x.X); res != "" {
-				return res + " (slice item)"
-			}
-		}
-		return ""
-	}
-
-	if name := dfs(val); name != "" {
-		return "'" + name + "'"
-	}
-	if val.Name() != "" {
-		return "'" + val.Name() + "'"
-	}
-	return fmt.Sprintf("%T", val)
-}
-
-// ============================================================================
-// GLOBAL PROJECT LOGIC AND SINK FINDERS
-// ============================================================================
 
 func buildTransitiveExecutors(funcs []*ssa.Function) map[string]bool {
 	execMap := make(map[*ssa.Function]bool)
 
+	// 1. Direct Executors
 	for _, fn := range funcs {
 		for _, b := range fn.Blocks {
 			for _, instr := range b.Instrs {
@@ -579,6 +343,7 @@ func buildTransitiveExecutors(funcs []*ssa.Function) map[string]bool {
 		}
 	}
 
+	// 2. Transitive Executors
 	changed := true
 	for changed {
 		changed = false
@@ -660,12 +425,65 @@ func getCallNameFromInstr(call ssa.CallInstruction) string {
 	return ""
 }
 
-func isGormFetchCondtion(methodName string) bool {
+func getGormFetchArgIndex(methodName string) int {
 	switch methodName {
-	case "Where", "Raw", "Not", "Or", "Select", "Query", "QueryRow":
-		return true
+	case "Where", "Raw", "Not", "Or", "Select":
+		return 1
+	case "Query", "QueryRow", "Exec":
+		return 1
 	}
-	return false
+	return -1
+}
+
+func resolveHumanName(val ssa.Value) string {
+	visited := make(map[ssa.Value]bool)
+	var dfs func(v ssa.Value) string
+	dfs = func(v ssa.Value) string {
+		if v == nil || visited[v] {
+			return ""
+		}
+		visited[v] = true
+		if alloc, ok := v.(*ssa.Alloc); ok && alloc.Comment != "" {
+			return alloc.Comment
+		}
+		if param, ok := v.(*ssa.Parameter); ok && param.Name() != "" {
+			return param.Name()
+		}
+		if global, ok := v.(*ssa.Global); ok && global.Name() != "" {
+			return global.Name()
+		}
+		if fv, ok := v.(*ssa.FreeVar); ok && fv.Name() != "" {
+			return fv.Name()
+		}
+		switch x := v.(type) {
+		case *ssa.MakeInterface:
+			return dfs(x.X)
+		case *ssa.ChangeType:
+			return dfs(x.X)
+		case *ssa.Slice:
+			return dfs(x.X)
+		case *ssa.UnOp:
+			return dfs(x.X)
+		case *ssa.Extract:
+			return dfs(x.Tuple)
+		case *ssa.FieldAddr:
+			if res := dfs(x.X); res != "" {
+				return res + " (struct field)"
+			}
+		case *ssa.IndexAddr:
+			if res := dfs(x.X); res != "" {
+				return res + " (slice item)"
+			}
+		}
+		return ""
+	}
+	if name := dfs(val); name != "" {
+		return "'" + name + "'"
+	}
+	if val.Name() != "" {
+		return "'" + val.Name() + "'"
+	}
+	return fmt.Sprintf("%T", val)
 }
 
 func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
@@ -683,7 +501,7 @@ func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
 	return []ssa.Value{d2}
 }
 
-func byPassFunction(call ssa.CallInstruction, fact ssa.Value) []ssa.Value {
+func applyCallToReturn(call ssa.CallInstruction, fact ssa.Value) []ssa.Value {
 	if callVal, ok := call.(ssa.Value); ok && callVal == fact {
 		return nil
 	}
@@ -697,9 +515,7 @@ func addPathEdge(worklist *[]PathEdge, P_set map[PathEdge]bool, edge PathEdge) {
 	}
 }
 
-func isEntryNode(node ProgramPoint) bool {
-	return node.Index == 0 && node.Block.Index == 0
-}
+func isEntryNode(node ProgramPoint) bool { return node.Index == 0 && node.Block.Index == 0 }
 
 func getPredecessors(p ProgramPoint) []ProgramPoint {
 	if p.Index > 0 {
