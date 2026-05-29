@@ -14,15 +14,22 @@ import (
 )
 
 // ---------------------------------------------------------
-// 1. AST PHASE: Loop Context Detection (With Executor Map)
+// 1. AST PHASE: Loop Context Detection (Compiler Aware)
 // ---------------------------------------------------------
 
+// LoopRange stores the exact, mathematical start and end position of a loop
+// in the abstract syntax tree. Because we use the same token.FileSet for AST and SSA,
+// token.Pos perfectly maps between both stages.
+type LoopRange struct {
+	Start token.Pos
+	End   token.Pos
+}
+
 type ASTLoopVisitor struct {
-	fset          *token.FileSet
-	inLoop        bool
-	isExecLoop    bool
-	Executors     map[string]bool
-	LoopLocations map[string]bool
+	inLoop     bool
+	isExecLoop bool
+	Executors  map[string]bool
+	LoopRanges *[]LoopRange // Pointer to accumulate across all files
 }
 
 func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
@@ -37,39 +44,22 @@ func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
 	case *ast.ForStmt:
 		isLoop = true
 		isExecLoop = astContainsExecutionMethod(loopNode.Body, v.Executors)
+		if isExecLoop {
+			*v.LoopRanges = append(*v.LoopRanges, LoopRange{Start: loopNode.Pos(), End: loopNode.End()})
+		}
 	case *ast.RangeStmt:
 		isLoop = true
 		isExecLoop = astContainsExecutionMethod(loopNode.Body, v.Executors)
-	}
-
-	// Original behavior: mark every AST child node's line
-	if isLoop && isExecLoop {
-		pos := v.fset.Position(n.Pos())
-		fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
-		v.LoopLocations[fileLineKey] = true
+		if isExecLoop {
+			*v.LoopRanges = append(*v.LoopRanges, LoopRange{Start: loopNode.Pos(), End: loopNode.End()})
+		}
 	}
 
 	return &ASTLoopVisitor{
-		fset:          v.fset,
-		inLoop:        isLoop,
-		isExecLoop:    isExecLoop,
-		Executors:     v.Executors,
-		LoopLocations: v.LoopLocations,
-	}
-}
-
-// markLoopLines marks every line from startPos to endPos in LoopLocations.
-// FIX #2: Instead of marking arbitrary AST child nodes, we mark the full
-// line range of the loop so multi-line calls are always covered.
-func markLoopLines(fset *token.FileSet, startPos, endPos token.Pos, loopLocations map[string]bool) {
-	start := fset.Position(startPos)
-	end := fset.Position(endPos)
-	if !start.IsValid() || !end.IsValid() {
-		return
-	}
-	for line := start.Line; line <= end.Line; line++ {
-		key := fmt.Sprintf("%s:%d", start.Filename, line)
-		loopLocations[key] = true
+		inLoop:     isLoop,
+		isExecLoop: isExecLoop,
+		Executors:  v.Executors,
+		LoopRanges: v.LoopRanges, // Carry pointer to inner nodes
 	}
 }
 
@@ -82,10 +72,6 @@ func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
 				name = sel.Sel.Name
 			} else if ident, ok := call.Fun.(*ast.Ident); ok {
 				name = ident.Name
-			}
-
-			if name == "DeletePartIteration" {
-				fmt.Println("fuck")
 			}
 
 			if isExecutionMethod(name) || executors[name] {
@@ -103,7 +89,7 @@ func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
 // ---------------------------------------------------------
 
 func main() {
-	targetDir := "/home/user/Desktop/dzfg/test/general-market/logistics/"
+	targetDir := "example/"
 	if len(os.Args) > 1 {
 		targetDir = os.Args[1]
 	}
@@ -124,7 +110,9 @@ func main() {
 	}
 
 	// Step 1: Build Global SSA
-	prog, _ := ssautil.AllPackages(initial, ssa.NaiveForm)
+	// FIX: Enable GlobalDebug as recommended, along with default NaiveForm,
+	// to ensure rigorous AST-to-SSA token.Pos mapping inside instructions.
+	prog, _ := ssautil.AllPackages(initial, ssa.NaiveForm|ssa.GlobalDebug)
 	prog.Build()
 
 	allFuncs := getAllFunctions(initial, prog)
@@ -133,10 +121,10 @@ func main() {
 	executors := buildTransitiveExecutors(allFuncs)
 
 	// Step 3: Run AST to map the loops, leveraging the Executor Map
+	loopRanges := make([]LoopRange, 0)
 	visitor := &ASTLoopVisitor{
-		fset:          prog.Fset,
-		LoopLocations: make(map[string]bool),
-		Executors:     executors,
+		Executors:  executors,
+		LoopRanges: &loopRanges,
 	}
 	for _, pkg := range initial {
 		for _, file := range pkg.Syntax {
@@ -144,10 +132,9 @@ func main() {
 		}
 	}
 
-	// FIX #1: Pass prog.Fset (SSA's FileSet) to Phase1 so SSA token
-	// positions are decoded correctly instead of using the AST fset.
-	LoopResolutions := Phase1_IFDS_Tabulation(allFuncs, visitor.LoopLocations, prog.Fset)
-	Phase2_VerifyNPlusOne(LoopResolutions, visitor.LoopLocations)
+	// Step 4: IFDS Tabulation, relying on mathematical token.Pos intersections
+	LoopResolutions := Phase1_IFDS_Tabulation(allFuncs, loopRanges, prog.Fset)
+	Phase2_VerifyNPlusOne(LoopResolutions)
 }
 
 // ---------------------------------------------------------
@@ -168,50 +155,51 @@ type PathEdge struct {
 }
 type SummaryCache map[*ssa.Function]map[ssa.Value][]ssa.Value
 
-func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopLocations map[string]bool, ssaFset *token.FileSet) map[string][]ssa.Value {
+func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopRanges []LoopRange, ssaFset *token.FileSet) map[string][]ssa.Value {
 	P_set := make(map[PathEdge]bool)
 	var worklist []PathEdge
 	summaries := make(SummaryCache)
 	LoopResolutions := make(map[string][]ssa.Value)
 
-	// SINK FINDER
+	// HELPER: Checks if an SSA position inherently falls within AST Loop Bounds
+	isInLoopBounds := func(pos token.Pos) bool {
+		if !pos.IsValid() {
+			return false
+		}
+		for _, lr := range loopRanges {
+			if pos >= lr.Start && pos <= lr.End {
+				return true
+			}
+		}
+		return false
+	}
+
 	// SINK FINDER
 	for _, fn := range allFunctions {
-
-		// FIX 1: Skip synthetic functions generated by the compiler.
-		// Their internal calls have bogus/invalid token.Pos() leading to wrong file/line paths.
 		if fn.Synthetic != "" {
-			continue
+			continue // Skip synthetic (compiler-generated) functions
 		}
 
 		for _, block := range fn.Blocks {
 			for i, instr := range block.Instrs {
-
-				// FIX 2: Use ssa.CallInstruction instead of *ssa.Call.
-				// This allows you to catch Interface method calls (*ssa.Invoke) alongside normal calls.
 				if call, ok := instr.(ssa.CallInstruction); ok {
 					methodName := getCallNameFromInstr(call)
 					sinkIndex := getGormFetchArgIndex(methodName)
 
-					// Temporary override so your debug print gets picked up
-					if methodName == "DeletePartIteration" {
-						fmt.Println("Found DeletePartIteration!")
+					// Print override for your custom testing!
+					if methodName == "print" || methodName == "DeletePartIteration" {
+						fmt.Printf("Found Sink! '%s'\n", methodName)
 					}
 
 					if sinkIndex != -1 && len(call.Common().Args) > sinkIndex {
 						val := call.Common().Args[sinkIndex]
+						callPos := call.Pos()
 
-						pos := ssaFset.Position(call.Pos())
-
-						// FIX 4: Safety checking. Skip invalid positions that don't map to real code
-						if !pos.IsValid() {
-							continue
-						}
-
-						fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
-
-						if loopLocations[fileLineKey] {
-							LoopResolutions[fileLineKey] = append(LoopResolutions[fileLineKey], val)
+						// 1. Is the execution physically sitting inside any known loop?
+						if isInLoopBounds(callPos) {
+							// Translate internal token to human-readable string for output ONLY
+							posString := ssaFset.Position(callPos).String()
+							LoopResolutions[posString] = append(LoopResolutions[posString], val)
 						}
 
 						sink := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
@@ -263,13 +251,12 @@ func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopLocations map[stri
 
 					for _, caller := range getGlobalMockCallers(fn, allFunctions) {
 						arg := caller.Common().Args[paramIdx]
+						callerPos := caller.Pos()
 
-						// FIX #1: Use ssaFset here too
-						pos := ssaFset.Position(caller.Pos())
-						fileLineKey := fmt.Sprintf("%s:%d", pos.Filename, pos.Line)
-
-						if loopLocations[fileLineKey] {
-							LoopResolutions[fileLineKey] = append(LoopResolutions[fileLineKey], arg)
+						// 2. Is the mocked caller physically inside any known loop bounds?
+						if isInLoopBounds(callerPos) {
+							posString := ssaFset.Position(callerPos).String()
+							LoopResolutions[posString] = append(LoopResolutions[posString], arg)
 						}
 
 						callerPoint := getInstructionPoint(caller)
@@ -297,7 +284,7 @@ func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopLocations map[stri
 // PHASE 2 & LOGIC UTILITIES
 // ---------------------------------------------------------
 
-func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value, LoopLocations map[string]bool) {
+func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value) {
 	fmt.Println("\n==========================================")
 	fmt.Println(">> PHASE 2: GORM N+1 VULNERABILITY REPORT")
 	fmt.Println("==========================================")
@@ -312,6 +299,7 @@ func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value, LoopLocations
 	for locationKey, resolvedArgs := range LoopResolutions {
 		isDynamicVariable := false
 
+		// Check if any argument tracing back is NOT a constant
 		for _, arg := range resolvedArgs {
 			if _, isConst := arg.(*ssa.Const); !isConst {
 				isDynamicVariable = true
@@ -320,7 +308,7 @@ func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value, LoopLocations
 
 		if isDynamicVariable {
 			vulnsFound++
-			fmt.Printf(" 🚨 [TRUE N+1] \t%s \n\t", locationKey)
+			fmt.Printf(" 🚨 [TRUE N+1] \t%s \n", locationKey)
 		}
 	}
 
@@ -409,7 +397,7 @@ func getAllFunctions(initial []*packages.Package, prog *ssa.Program) []*ssa.Func
 
 func isExecutionMethod(name string) bool {
 	switch name {
-	case "Scan", "Find", "First", "Take", "Last", "Pluck", "Count", "Exec", "QueryRow", "Query":
+	case "Scan", "Find", "First", "Take", "Last", "Pluck", "Count", "Exec", "QueryRow", "Query", "print":
 		return true
 	}
 	return false
@@ -431,59 +419,10 @@ func getGormFetchArgIndex(methodName string) int {
 		return 1
 	case "Query", "QueryRow", "Exec":
 		return 1
+	case "print": // Temp override to allow the logic to analyze your `print` test case!
+		return 0
 	}
 	return -1
-}
-
-func resolveHumanName(val ssa.Value) string {
-	visited := make(map[ssa.Value]bool)
-	var dfs func(v ssa.Value) string
-	dfs = func(v ssa.Value) string {
-		if v == nil || visited[v] {
-			return ""
-		}
-		visited[v] = true
-		if alloc, ok := v.(*ssa.Alloc); ok && alloc.Comment != "" {
-			return alloc.Comment
-		}
-		if param, ok := v.(*ssa.Parameter); ok && param.Name() != "" {
-			return param.Name()
-		}
-		if global, ok := v.(*ssa.Global); ok && global.Name() != "" {
-			return global.Name()
-		}
-		if fv, ok := v.(*ssa.FreeVar); ok && fv.Name() != "" {
-			return fv.Name()
-		}
-		switch x := v.(type) {
-		case *ssa.MakeInterface:
-			return dfs(x.X)
-		case *ssa.ChangeType:
-			return dfs(x.X)
-		case *ssa.Slice:
-			return dfs(x.X)
-		case *ssa.UnOp:
-			return dfs(x.X)
-		case *ssa.Extract:
-			return dfs(x.Tuple)
-		case *ssa.FieldAddr:
-			if res := dfs(x.X); res != "" {
-				return res + " (struct field)"
-			}
-		case *ssa.IndexAddr:
-			if res := dfs(x.X); res != "" {
-				return res + " (slice item)"
-			}
-		}
-		return ""
-	}
-	if name := dfs(val); name != "" {
-		return "'" + name + "'"
-	}
-	if val.Name() != "" {
-		return "'" + val.Name() + "'"
-	}
-	return fmt.Sprintf("%T", val)
 }
 
 func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
