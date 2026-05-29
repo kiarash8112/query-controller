@@ -14,12 +14,9 @@ import (
 )
 
 // ---------------------------------------------------------
-// 1. AST PHASE: Loop Context Detection (Compiler Aware)
+// 1. AST PHASE: Loop Context Detection
 // ---------------------------------------------------------
 
-// LoopRange stores the exact, mathematical start and end position of a loop
-// in the abstract syntax tree. Because we use the same token.FileSet for AST and SSA,
-// token.Pos perfectly maps between both stages.
 type LoopRange struct {
 	Start token.Pos
 	End   token.Pos
@@ -29,7 +26,7 @@ type ASTLoopVisitor struct {
 	inLoop     bool
 	isExecLoop bool
 	Executors  map[string]bool
-	LoopRanges *[]LoopRange // Pointer to accumulate across all files
+	LoopRanges *[]LoopRange
 }
 
 func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
@@ -59,7 +56,7 @@ func (v *ASTLoopVisitor) Visit(n ast.Node) ast.Visitor {
 		inLoop:     isLoop,
 		isExecLoop: isExecLoop,
 		Executors:  v.Executors,
-		LoopRanges: v.LoopRanges, // Carry pointer to inner nodes
+		LoopRanges: v.LoopRanges,
 	}
 }
 
@@ -96,7 +93,6 @@ func main() {
 	fmt.Printf(">> LOADING PROJECT: %s\n", targetDir)
 
 	fset := token.NewFileSet()
-
 	cfg := &packages.Config{
 		Fset: fset,
 		Dir:  targetDir,
@@ -109,18 +105,12 @@ func main() {
 		log.Fatalf("Load failed: %v", err)
 	}
 
-	// Step 1: Build Global SSA
-	// FIX: Enable GlobalDebug as recommended, along with default NaiveForm,
-	// to ensure rigorous AST-to-SSA token.Pos mapping inside instructions.
 	prog, _ := ssautil.AllPackages(initial, ssa.NaiveForm|ssa.GlobalDebug)
 	prog.Build()
 
 	allFuncs := getAllFunctions(initial, prog)
-
-	// Step 2: Dynamically calculate which wrappers are Execution functions
 	executors := buildTransitiveExecutors(allFuncs)
 
-	// Step 3: Run AST to map the loops, leveraging the Executor Map
 	loopRanges := make([]LoopRange, 0)
 	visitor := &ASTLoopVisitor{
 		Executors:  executors,
@@ -132,13 +122,15 @@ func main() {
 		}
 	}
 
-	// Step 4: IFDS Tabulation, relying on mathematical token.Pos intersections
-	LoopResolutions := Phase1_IFDS_Tabulation(allFuncs, loopRanges, prog.Fset)
-	Phase2_VerifyNPlusOne(LoopResolutions)
+	// Phase 1: Pure dataflow mapping (Tracks ALL args and slices)
+	AllResolutions := Phase1_IFDS_Tabulation(allFuncs)
+
+	// Phase 2: Vulnerability Detection
+	Phase2_VerifyNPlusOne(AllResolutions, loopRanges, prog.Fset)
 }
 
 // ---------------------------------------------------------
-// IFDS PHASE 1: Dataflow Tracing
+// IFDS PHASE 1: Pure Dataflow Tracing
 // ---------------------------------------------------------
 
 type ProgramPoint struct {
@@ -155,51 +147,30 @@ type PathEdge struct {
 }
 type SummaryCache map[*ssa.Function]map[ssa.Value][]ssa.Value
 
-func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopRanges []LoopRange, ssaFset *token.FileSet) map[string][]ssa.Value {
+func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function) map[token.Pos][]ssa.Value {
 	P_set := make(map[PathEdge]bool)
 	var worklist []PathEdge
 	summaries := make(SummaryCache)
-	LoopResolutions := make(map[string][]ssa.Value)
-
-	// HELPER: Checks if an SSA position inherently falls within AST Loop Bounds
-	isInLoopBounds := func(pos token.Pos) bool {
-		if !pos.IsValid() {
-			return false
-		}
-		for _, lr := range loopRanges {
-			if pos >= lr.Start && pos <= lr.End {
-				return true
-			}
-		}
-		return false
-	}
+	AllResolutions := make(map[token.Pos][]ssa.Value)
 
 	// SINK FINDER
 	for _, fn := range allFunctions {
 		if fn.Synthetic != "" {
-			continue // Skip synthetic (compiler-generated) functions
+			continue
 		}
 
 		for _, block := range fn.Blocks {
 			for i, instr := range block.Instrs {
 				if call, ok := instr.(ssa.CallInstruction); ok {
-					methodName := getCallNameFromInstr(call)
-					sinkIndex := getGormFetchArgIndex(methodName)
 
-					// Print override for your custom testing!
-					if methodName == "print" || methodName == "DeletePartIteration" {
-						fmt.Printf("Found Sink! '%s'\n", methodName)
-					}
+					// Get ALL targets for this specific GORM method
+					targetArgs := getGormSinkArgs(call)
 
-					if sinkIndex != -1 && len(call.Common().Args) > sinkIndex {
-						val := call.Common().Args[sinkIndex]
+					for _, val := range targetArgs {
 						callPos := call.Pos()
 
-						// 1. Is the execution physically sitting inside any known loop?
-						if isInLoopBounds(callPos) {
-							// Translate internal token to human-readable string for output ONLY
-							posString := ssaFset.Position(callPos).String()
-							LoopResolutions[posString] = append(LoopResolutions[posString], val)
+						if callPos.IsValid() {
+							AllResolutions[callPos] = append(AllResolutions[callPos], val)
 						}
 
 						sink := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
@@ -253,10 +224,8 @@ func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopRanges []LoopRange
 						arg := caller.Common().Args[paramIdx]
 						callerPos := caller.Pos()
 
-						// 2. Is the mocked caller physically inside any known loop bounds?
-						if isInLoopBounds(callerPos) {
-							posString := ssaFset.Position(callerPos).String()
-							LoopResolutions[posString] = append(LoopResolutions[posString], arg)
+						if callerPos.IsValid() {
+							AllResolutions[callerPos] = append(AllResolutions[callerPos], arg)
 						}
 
 						callerPoint := getInstructionPoint(caller)
@@ -277,29 +246,90 @@ func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function, loopRanges []LoopRange
 			}
 		}
 	}
-	return LoopResolutions
+	return AllResolutions
 }
 
 // ---------------------------------------------------------
-// PHASE 2 & LOGIC UTILITIES
+// DATAFLOW LOGIC ENHANCED FOR SLICES/VARIADICS
 // ---------------------------------------------------------
 
-func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value) {
+func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
+	// Case 1: If THIS instruction literally creates our tracked variable
+	if instrVal, ok := instr.(ssa.Value); ok && instrVal == d2 {
+		var newFacts []ssa.Value
+		for _, opPtr := range instr.Operands(nil) {
+			if opPtr != nil && *opPtr != nil {
+				newFacts = append(newFacts, *opPtr)
+			}
+		}
+		return newFacts
+	}
+
+	// Case 2: Unpacking Go memory stores (Slice variadics, Structs)
+	if store, ok := instr.(*ssa.Store); ok {
+		// Target pointer memory directly?
+		if store.Addr == d2 {
+			return []ssa.Value{d2, store.Val}
+		}
+		// Is this a store into a Slice/Array we are tracking?
+		if idx, isIdx := store.Addr.(*ssa.IndexAddr); isIdx && idx.X == d2 {
+			return []ssa.Value{d2, store.Val} // Start tracking the stored element too!
+		}
+		// Is this a store into a Struct property we are tracking?
+		if fld, isFld := store.Addr.(*ssa.FieldAddr); isFld && fld.X == d2 {
+			return []ssa.Value{d2, store.Val}
+		}
+	}
+
+	// Default: Unaffected, pass it back unchanged.
+	return []ssa.Value{d2}
+}
+
+// ---------------------------------------------------------
+// PHASE 2 & SINK UTILITIES
+// ---------------------------------------------------------
+
+func getGormSinkArgs(call ssa.CallInstruction) []ssa.Value {
+	methodName := getCallNameFromInstr(call)
+
+	switch methodName {
+	// GORM methods structure: [0] Receiver, [1] Query string/struct, [2...] Variadic arguments.
+	// We want to track everything from Index 1 onward!
+	case "Where", "Raw", "Not", "Or", "Select", "Having", "Group", "Order", "Query", "QueryRow", "Exec":
+		if len(call.Common().Args) > 1 {
+			return call.Common().Args[1:] // Track all arguments!
+		}
+	case "print":
+		if len(call.Common().Args) > 0 {
+			return call.Common().Args[:] // Builtin has no receiver, track all
+		}
+	}
+	return nil
+}
+
+func Phase2_VerifyNPlusOne(AllResolutions map[token.Pos][]ssa.Value, loopRanges []LoopRange, fset *token.FileSet) {
 	fmt.Println("\n==========================================")
 	fmt.Println(">> PHASE 2: GORM N+1 VULNERABILITY REPORT")
 	fmt.Println("==========================================")
 
-	if len(LoopResolutions) == 0 {
-		fmt.Println(" ✅ Project Clean! No N+1 Queries detected.")
-		return
-	}
-
 	vulnsFound := 0
 
-	for locationKey, resolvedArgs := range LoopResolutions {
-		isDynamicVariable := false
+	isInLoopBounds := func(pos token.Pos) bool {
+		for _, lr := range loopRanges {
+			if pos >= lr.Start && pos <= lr.End {
+				return true
+			}
+		}
+		return false
+	}
 
-		// Check if any argument tracing back is NOT a constant
+	for pos, resolvedArgs := range AllResolutions {
+		if !isInLoopBounds(pos) {
+			continue
+		}
+
+		// Check if AT LEAST ONE of the resolved variables in the entire query is dynamic
+		isDynamicVariable := false
 		for _, arg := range resolvedArgs {
 			if _, isConst := arg.(*ssa.Const); !isConst {
 				isDynamicVariable = true
@@ -308,19 +338,19 @@ func Phase2_VerifyNPlusOne(LoopResolutions map[string][]ssa.Value) {
 
 		if isDynamicVariable {
 			vulnsFound++
-			fmt.Printf(" 🚨 [TRUE N+1] \t%s \n", locationKey)
+			posString := fset.Position(pos).String()
+			fmt.Printf(" 🚨 [TRUE N+1] Found dynamic database execution in loop at \t%s \n", posString)
 		}
 	}
 
 	if vulnsFound == 0 {
-		fmt.Println(" ✅ Project Clean! All loops use safe, hardcoded static queries.")
+		fmt.Println(" ✅ Project Clean! No N+1 Queries detected.")
 	}
 }
 
 func buildTransitiveExecutors(funcs []*ssa.Function) map[string]bool {
 	execMap := make(map[*ssa.Function]bool)
 
-	// 1. Direct Executors
 	for _, fn := range funcs {
 		for _, b := range fn.Blocks {
 			for _, instr := range b.Instrs {
@@ -331,7 +361,6 @@ func buildTransitiveExecutors(funcs []*ssa.Function) map[string]bool {
 		}
 	}
 
-	// 2. Transitive Executors
 	changed := true
 	for changed {
 		changed = false
@@ -411,33 +440,6 @@ func getCallNameFromInstr(call ssa.CallInstruction) string {
 		return callee.Name()
 	}
 	return ""
-}
-
-func getGormFetchArgIndex(methodName string) int {
-	switch methodName {
-	case "Where", "Raw", "Not", "Or", "Select":
-		return 1
-	case "Query", "QueryRow", "Exec":
-		return 1
-	case "print": // Temp override to allow the logic to analyze your `print` test case!
-		return 0
-	}
-	return -1
-}
-
-func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
-	if instrVal, ok := instr.(ssa.Value); ok && instrVal == d2 {
-		var newFacts []ssa.Value
-		for _, opPtr := range instr.Operands(nil) {
-			if opPtr != nil && *opPtr != nil {
-				newFacts = append(newFacts, *opPtr)
-			}
-		}
-		return newFacts
-	} else if store, ok := instr.(*ssa.Store); ok && store.Addr == d2 {
-		return []ssa.Value{store.Val}
-	}
-	return []ssa.Value{d2}
 }
 
 func applyCallToReturn(call ssa.CallInstruction, fact ssa.Value) []ssa.Value {

@@ -1,10 +1,7 @@
 package main
 
 import (
-	"fmt"
-
 	db "github.com/kiarash8112/querycontroller/examples"
-	"github.com/kiarash8112/querycontroller/examples/example2"
 )
 
 type User struct {
@@ -12,19 +9,15 @@ type User struct {
 }
 
 func main() {
-	users := []User{User{name: "admin"}, User{name: "guest"}}
+	users := []User{{name: "admin"}, {name: "guest"}}
 	db := &db.GormDB{}
 
 	for _, u := range users {
-		
-		pritn()
-
-		example2.GetUser(db, u.name)
+		GetUser(db, u.name)
 	}
 
 }
 
-func pritn() {
-	example2.DoSome()
-	fmt.Println("got here")
+func GetUser(db *db.GormDB, u string) {
+	db.Where("it is", u).Find(nil)
 }
