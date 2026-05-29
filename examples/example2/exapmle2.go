@@ -5,12 +5,7 @@ import (
 	"github.com/kiarash8112/querycontroller/examples/example3"
 )
 
-func GetUser(db *db.GormDB, u string) {
-	db.Where("it is", u).Find(nil)
-	if false {
-		getuser4(db, u)
-	}
-}
+
 
 func getuser4(db *db.GormDB, u string) {
 	if false {
