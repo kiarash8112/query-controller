@@ -21,3 +21,12 @@ func main() {
 func GetUser(db *db.GormDB, u string) {
 	db.Where("it is", u).Find(nil)
 }
+
+func getID() int {
+	return getID() // Recursive call
+}
+
+func main1(db *db.GormDB) {
+	id := getID()
+	db.Where("id = ?", id) // Sink
+}
