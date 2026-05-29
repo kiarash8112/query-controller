@@ -1,17 +1,30 @@
 package main
 
-type GormDB struct{}
+import (
+	"fmt"
 
-func (db *GormDB) Where(query interface{}, args ...interface{}) *GormDB { return db }
-func (db *GormDB) Find(dest interface{}, conds ...interface{}) *GormDB  { return db }
-func (db *GormDB) Create(value interface{}) *GormDB                     { return db }
+	db "github.com/kiarash8112/querycontroller/examples"
+	"github.com/kiarash8112/querycontroller/examples/example2"
+)
+
+type User struct {
+	name string
+}
 
 func main() {
-	users := []string{"admin", "guest"}
-	db := &GormDB{}
+	users := []User{User{name: "admin"}, User{name: "guest"}}
+	db := &db.GormDB{}
 
 	for _, u := range users {
-		db.Where(u).Find(nil)
+		
+		pritn()
+
+		example2.GetUser(db, u.name)
 	}
 
+}
+
+func pritn() {
+	example2.DoSome()
+	fmt.Println("got here")
 }
