@@ -122,16 +122,18 @@ func main() {
 		}
 	}
 
-	// Phase 1: Pure dataflow mapping (Tracks ALL args and slices)
+	// Phase 1: Context-Aware Dataflow Trace (Pure Stack)
 	AllResolutions := Phase1_IFDS_Tabulation(allFuncs)
 
-	// Phase 2: Vulnerability Detection
+	// Phase 2: Vulnerability Checker
 	Phase2_VerifyNPlusOne(AllResolutions, loopRanges, prog.Fset)
 }
 
 // ---------------------------------------------------------
-// IFDS PHASE 1: Pure Dataflow Tracing
+// IFDS PHASE 1: Pure Dataflow Tracing (Call Stack Context)
 // ---------------------------------------------------------
+
+const MaxCallStackDepth = 7 // Prevent infinite recursive tracing (k-CFA limit)
 
 type ProgramPoint struct {
 	Block *ssa.BasicBlock
@@ -141,40 +143,66 @@ type ExplodedNode struct {
 	Point ProgramPoint
 	Fact  ssa.Value
 }
-type PathEdge struct {
+type StackFrame struct {
+	Call  ssa.CallInstruction
 	Start ExplodedNode
-	End   ExplodedNode
 }
-type SummaryCache map[*ssa.Function]map[ssa.Value][]ssa.Value
+type PathEdge struct {
+	Start     ExplodedNode
+	End       ExplodedNode
+	CallStack []StackFrame
+}
+
+// Helper to safely clone the stack slice to avoid pointer overwrites
+func cloneStack(stack []StackFrame) []StackFrame {
+	if len(stack) == 0 {
+		return nil
+	}
+	ns := make([]StackFrame, len(stack))
+	copy(ns, stack)
+	return ns
+}
+
+// Helper to hash edges for our P_set
+func hashEdge(e PathEdge) string {
+	stackHash := ""
+	for _, s := range e.CallStack {
+		stackHash += fmt.Sprintf("[%p]", s.Call)
+	}
+	return fmt.Sprintf("S:%p:%d:%p|E:%p:%d:%p|ST:%s",
+		e.Start.Point.Block, e.Start.Point.Index, e.Start.Fact,
+		e.End.Point.Block, e.End.Point.Index, e.End.Fact, stackHash)
+}
 
 func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function) map[token.Pos][]ssa.Value {
-	P_set := make(map[PathEdge]bool)
+	P_set := make(map[string]bool)
 	var worklist []PathEdge
-	summaries := make(SummaryCache)
+
 	AllResolutions := make(map[token.Pos][]ssa.Value)
 
-	// SINK FINDER
+	addPathEdge := func(edge PathEdge) {
+		key := hashEdge(edge)
+		if !P_set[key] {
+			P_set[key] = true
+			worklist = append(worklist, edge)
+		}
+	}
+
+	// SINK FINDER (Initializes with Empty Stack)
 	for _, fn := range allFunctions {
 		if fn.Synthetic != "" {
 			continue
 		}
-
 		for _, block := range fn.Blocks {
 			for i, instr := range block.Instrs {
 				if call, ok := instr.(ssa.CallInstruction); ok {
-
-					// Get ALL targets for this specific GORM method
 					targetArgs := getGormSinkArgs(call)
-
 					for _, val := range targetArgs {
-						callPos := call.Pos()
-
-						if callPos.IsValid() {
-							AllResolutions[callPos] = append(AllResolutions[callPos], val)
+						if call.Pos().IsValid() {
+							AllResolutions[call.Pos()] = append(AllResolutions[call.Pos()], val)
 						}
-
 						sink := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
-						addPathEdge(&worklist, P_set, PathEdge{Start: sink, End: sink})
+						addPathEdge(PathEdge{Start: sink, End: sink, CallStack: nil}) // Empty stack!
 					}
 				}
 			}
@@ -191,57 +219,101 @@ func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function) map[token.Pos][]ssa.Va
 		instr := v2.Block.Instrs[v2.Index]
 
 		if callInstr, ok := instr.(ssa.CallInstruction); ok {
+
+			// SCENARIO 1: Tracked variable comes from a Function Call (e.g. id := SafeFunc())
 			if callVal, ok := callInstr.(ssa.Value); ok && callVal == d2 {
 				callee := callInstr.Common().StaticCallee()
 				if callee != nil {
+
+					// --- FIX FOR INFINITE LOOPS ---
+					// Prevent unbounded stack growth in the presence of recursion.
+					if len(edge.CallStack) >= MaxCallStackDepth {
+						continue // Drop tracing this path; we've gone too deep
+					}
+					// ------------------------------
+
 					for _, block := range callee.Blocks {
 						for i, retInstr := range block.Instrs {
-							if ret, ok := retInstr.(*ssa.Return); ok {
-								newCtx := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: ret.Results[0]}
-								addPathEdge(&worklist, P_set, PathEdge{Start: newCtx, End: newCtx})
+							if ret, ok := retInstr.(*ssa.Return); ok && len(ret.Results) > 0 {
+								calleeD1 := ret.Results[0]
+
+								// Start tracing inside the child, push Caller onto Stack
+								newCtx := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: calleeD1}
+
+								newStack := cloneStack(edge.CallStack)
+								newStack = append(newStack, StackFrame{
+									Call:  callInstr,
+									Start: edge.Start, // Safely save the caller's start context!
+								})
+
+								addPathEdge(PathEdge{Start: newCtx, End: newCtx, CallStack: newStack})
 							}
 						}
 					}
 				}
 			} else {
+				// Bypass instruction entirely if it's not what we are tracking
 				for _, nd2 := range applyCallToReturn(callInstr, d2) {
 					for _, prevPoint := range getPredecessors(v2) {
-						addPathEdge(&worklist, P_set, PathEdge{Start: edge.Start, End: ExplodedNode{Point: prevPoint, Fact: nd2}})
+						addPathEdge(PathEdge{Start: edge.Start, End: ExplodedNode{Point: prevPoint, Fact: nd2}, CallStack: cloneStack(edge.CallStack)})
 					}
 				}
 			}
+
+			// SCENARIO 2: Reached the Top of a Function (Entry Parameters)
 		} else if isEntryNode(v2) {
 			fn := v2.Block.Parent()
 			for paramIdx, param := range fn.Params {
 				if param == d2 {
-					d1 := edge.Start.Fact
-					if summaries[fn] == nil {
-						summaries[fn] = make(map[ssa.Value][]ssa.Value)
-					}
-					summaries[fn][d1] = append(summaries[fn][d1], d2)
 
-					for _, caller := range getGlobalMockCallers(fn, allFunctions) {
-						arg := caller.Common().Args[paramIdx]
-						callerPos := caller.Pos()
+					// 2A) POP THE STACK: We entered to fetch data. Context restores to specific caller.
+					if len(edge.CallStack) > 0 {
+						lastFrame := edge.CallStack[len(edge.CallStack)-1]
+						newStack := cloneStack(edge.CallStack[:len(edge.CallStack)-1]) // POP
 
-						if callerPos.IsValid() {
-							AllResolutions[callerPos] = append(AllResolutions[callerPos], arg)
+						callerInstr := lastFrame.Call
+						if len(callerInstr.Common().Args) > paramIdx {
+							actualArg := callerInstr.Common().Args[paramIdx]
+
+							if callerInstr.Pos().IsValid() {
+								AllResolutions[callerInstr.Pos()] = append(AllResolutions[callerInstr.Pos()], actualArg)
+							}
+							callerPoint := getInstructionPoint(callerInstr)
+							for _, prevPoint := range getPredecessors(callerPoint) {
+								addPathEdge(PathEdge{
+									Start:     lastFrame.Start, // Restoring original Start Node safely!
+									End:       ExplodedNode{Point: prevPoint, Fact: actualArg},
+									CallStack: newStack,
+								})
+							}
 						}
+					} else {
+						// 2B) STACK IS EMPTY: This is a Sink-Wrapper that needs to propagate backwards (e.g. GetUser)
+						for _, caller := range getGlobalMockCallers(fn, allFunctions) {
+							if len(caller.Common().Args) > paramIdx {
+								arg := caller.Common().Args[paramIdx]
 
-						callerPoint := getInstructionPoint(caller)
-						for _, prevPoint := range getPredecessors(callerPoint) {
-							addPathEdge(&worklist, P_set, PathEdge{
-								Start: ExplodedNode{Point: prevPoint, Fact: arg},
-								End:   ExplodedNode{Point: prevPoint, Fact: arg},
-							})
+								if caller.Pos().IsValid() {
+									AllResolutions[caller.Pos()] = append(AllResolutions[caller.Pos()], arg)
+								}
+								callerPoint := getInstructionPoint(caller)
+								for _, prevPoint := range getPredecessors(callerPoint) {
+									addPathEdge(PathEdge{
+										Start:     ExplodedNode{Point: prevPoint, Fact: arg},
+										End:       ExplodedNode{Point: prevPoint, Fact: arg},
+										CallStack: nil, // Still propagating up as a root sink track!
+									})
+								}
+							}
 						}
 					}
 				}
 			}
 		} else {
+			// Normal Instruction Flow (Assignments, Constants, math)
 			for _, nd2 := range applyNormalFlow(instr, d2) {
 				for _, prevPoint := range getPredecessors(v2) {
-					addPathEdge(&worklist, P_set, PathEdge{Start: edge.Start, End: ExplodedNode{Point: prevPoint, Fact: nd2}})
+					addPathEdge(PathEdge{Start: edge.Start, End: ExplodedNode{Point: prevPoint, Fact: nd2}, CallStack: cloneStack(edge.CallStack)})
 				}
 			}
 		}
@@ -250,11 +322,10 @@ func Phase1_IFDS_Tabulation(allFunctions []*ssa.Function) map[token.Pos][]ssa.Va
 }
 
 // ---------------------------------------------------------
-// DATAFLOW LOGIC ENHANCED FOR SLICES/VARIADICS
+// DATAFLOW ENHANCED FOR SLICES/VARIADICS
 // ---------------------------------------------------------
 
 func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
-	// Case 1: If THIS instruction literally creates our tracked variable
 	if instrVal, ok := instr.(ssa.Value); ok && instrVal == d2 {
 		var newFacts []ssa.Value
 		for _, opPtr := range instr.Operands(nil) {
@@ -265,23 +336,17 @@ func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
 		return newFacts
 	}
 
-	// Case 2: Unpacking Go memory stores (Slice variadics, Structs)
 	if store, ok := instr.(*ssa.Store); ok {
-		// Target pointer memory directly?
 		if store.Addr == d2 {
 			return []ssa.Value{d2, store.Val}
 		}
-		// Is this a store into a Slice/Array we are tracking?
 		if idx, isIdx := store.Addr.(*ssa.IndexAddr); isIdx && idx.X == d2 {
-			return []ssa.Value{d2, store.Val} // Start tracking the stored element too!
+			return []ssa.Value{d2, store.Val}
 		}
-		// Is this a store into a Struct property we are tracking?
 		if fld, isFld := store.Addr.(*ssa.FieldAddr); isFld && fld.X == d2 {
 			return []ssa.Value{d2, store.Val}
 		}
 	}
-
-	// Default: Unaffected, pass it back unchanged.
 	return []ssa.Value{d2}
 }
 
@@ -291,17 +356,14 @@ func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
 
 func getGormSinkArgs(call ssa.CallInstruction) []ssa.Value {
 	methodName := getCallNameFromInstr(call)
-
 	switch methodName {
-	// GORM methods structure: [0] Receiver, [1] Query string/struct, [2...] Variadic arguments.
-	// We want to track everything from Index 1 onward!
 	case "Where", "Raw", "Not", "Or", "Select", "Having", "Group", "Order", "Query", "QueryRow", "Exec":
 		if len(call.Common().Args) > 1 {
-			return call.Common().Args[1:] // Track all arguments!
+			return call.Common().Args[1:]
 		}
 	case "print":
 		if len(call.Common().Args) > 0 {
-			return call.Common().Args[:] // Builtin has no receiver, track all
+			return call.Common().Args[:]
 		}
 	}
 	return nil
@@ -328,7 +390,6 @@ func Phase2_VerifyNPlusOne(AllResolutions map[token.Pos][]ssa.Value, loopRanges 
 			continue
 		}
 
-		// Check if AT LEAST ONE of the resolved variables in the entire query is dynamic
 		isDynamicVariable := false
 		for _, arg := range resolvedArgs {
 			if _, isConst := arg.(*ssa.Const); !isConst {
@@ -361,8 +422,7 @@ func buildTransitiveExecutors(funcs []*ssa.Function) map[string]bool {
 		}
 	}
 
-	changed := true
-	for changed {
+	for changed := true; changed; {
 		changed = false
 		for _, fn := range funcs {
 			if execMap[fn] {
@@ -449,13 +509,6 @@ func applyCallToReturn(call ssa.CallInstruction, fact ssa.Value) []ssa.Value {
 	return []ssa.Value{fact}
 }
 
-func addPathEdge(worklist *[]PathEdge, P_set map[PathEdge]bool, edge PathEdge) {
-	if !P_set[edge] {
-		P_set[edge] = true
-		*worklist = append(*worklist, edge)
-	}
-}
-
 func isEntryNode(node ProgramPoint) bool { return node.Index == 0 && node.Block.Index == 0 }
 
 func getPredecessors(p ProgramPoint) []ProgramPoint {
@@ -471,6 +524,16 @@ func getPredecessors(p ProgramPoint) []ProgramPoint {
 	return preds
 }
 
+func getInstructionPoint(instr ssa.Instruction) ProgramPoint {
+	b := instr.Block()
+	for i, inst := range b.Instrs {
+		if inst == instr {
+			return ProgramPoint{Block: b, Index: i}
+		}
+	}
+	return ProgramPoint{}
+}
+
 func getGlobalMockCallers(fn *ssa.Function, allFunctions []*ssa.Function) []ssa.CallInstruction {
 	var callers []ssa.CallInstruction
 	for _, cFn := range allFunctions {
@@ -483,14 +546,4 @@ func getGlobalMockCallers(fn *ssa.Function, allFunctions []*ssa.Function) []ssa.
 		}
 	}
 	return callers
-}
-
-func getInstructionPoint(instr ssa.Instruction) ProgramPoint {
-	b := instr.Block()
-	for i, inst := range b.Instrs {
-		if inst == instr {
-			return ProgramPoint{Block: b, Index: i}
-		}
-	}
-	return ProgramPoint{}
 }
