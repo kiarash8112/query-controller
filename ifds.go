@@ -86,7 +86,7 @@ func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
 // ---------------------------------------------------------
 
 func main() {
-	targetDir := "example/"
+	targetDir := "examples/"
 	if len(os.Args) > 1 {
 		targetDir = os.Args[1]
 	}
