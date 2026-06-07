@@ -23,6 +23,20 @@ func TestBaseScenario(t *testing.T) {
 	analysistest.Run(t, testdataDir(t), analyzers[0], "base_scenario/code.go")
 }
 
+func TestDynamicBuild(t *testing.T) {
+	newPlugin, err := register.GetPlugin("nplusone")
+	require.NoError(t, err)
+
+	plugin, err := newPlugin(nil)
+	require.NoError(t, err)
+
+	analyzers, err := plugin.BuildAnalyzers()
+	require.NoError(t, err)
+
+	analysistest.Run(t, testdataDir(t), analyzers[0], "dynamic_build/code.go")
+}
+
+
 func testdataDir(t *testing.T) string {
 	t.Helper()
 
