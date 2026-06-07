@@ -1,0 +1,5 @@
+version: v2.4.0
+
+plugins:
+  - module: github.com/kiarash8112/querycontrolleranalyzer
+    path: /home/user/Desktop/queryController/analyzerVersion
