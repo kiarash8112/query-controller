@@ -7,58 +7,204 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-func getPredecessorFacts(fact ssa.Value) []ssa.Value {
-	switch v := fact.(type) {
-	case *ssa.MakeInterface:
-		return []ssa.Value{v.X}
-	case *ssa.ChangeType:
-		return []ssa.Value{v.X}
-	case *ssa.Convert:
-		return []ssa.Value{v.X}
-	case *ssa.Slice:
-		return []ssa.Value{v.X}
-	case *ssa.Field:
-		return []ssa.Value{v.X}
-	case *ssa.FieldAddr:
-		return []ssa.Value{v.X}
-	case *ssa.UnOp:
-		return []ssa.Value{v.X}
-	case *ssa.Extract:
-		return []ssa.Value{v.Tuple}
-	case *ssa.Phi:
-		return v.Edges
-	case *ssa.Alloc:
-		var res []ssa.Value
-		if v.Referrers() != nil {
-			for _, ref := range *v.Referrers() {
-				if store, ok := ref.(*ssa.Store); ok && store.Addr == v {
-					res = append(res, store.Val)
-				}
-				if idxAddr, ok := ref.(*ssa.IndexAddr); ok {
-					if idxAddr.Referrers() != nil {
-						for _, idxRef := range *idxAddr.Referrers() {
-							if store, ok := idxRef.(*ssa.Store); ok && store.Addr == idxAddr {
-								res = append(res, store.Val)
-							}
-						}
-					}
-				}
+type ProgramPoint struct {
+	Block *ssa.BasicBlock
+	Index int
+}
+
+type traceNode struct {
+	Point ProgramPoint
+	Fact  ssa.Value
+}
+
+func isEntryNode(node ProgramPoint) bool {
+	return node.Index == 0 && node.Block.Index == 0
+}
+
+func getPredecessors(p ProgramPoint) []ProgramPoint {
+	if p.Index > 0 {
+		return []ProgramPoint{{Block: p.Block, Index: p.Index - 1}}
+	}
+	var preds []ProgramPoint
+	for _, predBlock := range p.Block.Preds {
+		if len(predBlock.Instrs) > 0 {
+			preds = append(preds, ProgramPoint{Block: predBlock, Index: len(predBlock.Instrs) - 1})
+		}
+	}
+	return preds
+}
+
+func getInstructionPoint(instr ssa.Instruction) ProgramPoint {
+	b := instr.Block()
+	for i, inst := range b.Instrs {
+		if inst == instr {
+			return ProgramPoint{Block: b, Index: i}
+		}
+	}
+	return ProgramPoint{}
+}
+
+func applyCallToReturn(call ssa.CallInstruction, fact ssa.Value) []ssa.Value {
+	if callVal, ok := call.(ssa.Value); ok && callVal == fact {
+		return nil
+	}
+	return []ssa.Value{fact}
+}
+
+func applyNormalFlow(instr ssa.Instruction, d2 ssa.Value) []ssa.Value {
+	if instrVal, ok := instr.(ssa.Value); ok && instrVal == d2 {
+		var newFacts []ssa.Value
+		for _, opPtr := range instr.Operands(nil) {
+			if opPtr != nil && *opPtr != nil {
+				newFacts = append(newFacts, *opPtr)
 			}
 		}
-		return res
+		return newFacts
+	}
+
+	if store, ok := instr.(*ssa.Store); ok {
+		if store.Addr == d2 {
+			return []ssa.Value{d2, store.Val}
+		}
+		if idx, isIdx := store.Addr.(*ssa.IndexAddr); isIdx && idx.X == d2 {
+			return []ssa.Value{d2, store.Val}
+		}
+		if fld, isFld := store.Addr.(*ssa.FieldAddr); isFld && fld.X == d2 {
+			return []ssa.Value{d2, store.Val}
+		}
+	}
+	return []ssa.Value{d2}
+}
+
+func getReturnFact(callee *ssa.Function, localRet map[*ssa.Function]*ReturnToParamFact, pass *analysis.Pass) *ReturnToParamFact {
+	if callee == nil {
+		return nil
+	}
+	if fr, ok := localRet[callee]; ok {
+		return fr
+	}
+	if obj := callee.Object(); obj != nil {
+		var exportedFact ReturnToParamFact
+		if pass.ImportObjectFact(obj, &exportedFact) {
+			return &exportedFact
+		}
 	}
 	return nil
 }
 
+func resolveCallResult(fact ssa.Value) (*ssa.Call, int, bool) {
+	switch v := fact.(type) {
+	case *ssa.Call:
+		return v, 0, true
+	case *ssa.Extract:
+		if call, ok := v.Tuple.(*ssa.Call); ok {
+			return call, v.Index, true
+		}
+	}
+	return nil, 0, false
+}
+
+func applyCrossPackageSummary(
+	d2 ssa.Value,
+	localRet map[*ssa.Function]*ReturnToParamFact,
+	pass *analysis.Pass,
+) (callPoint ProgramPoint, argFacts []ssa.Value, ok bool) {
+	call, retIdx, isCallResult := resolveCallResult(d2)
+	if !isCallResult {
+		return ProgramPoint{}, nil, false
+	}
+
+	retFact := getReturnFact(call.Call.StaticCallee(), localRet, pass)
+	if retFact == nil {
+		return ProgramPoint{}, nil, false
+	}
+
+	mappedParams := retFact.ResultToParams[retIdx]
+	if len(mappedParams) == 0 {
+		return ProgramPoint{}, nil, false
+	}
+
+	callPoint = getInstructionPoint(call)
+	for _, pIdx := range mappedParams {
+		if pIdx < len(call.Call.Args) {
+			argFacts = append(argFacts, call.Call.Args[pIdx])
+		}
+	}
+	return callPoint, argFacts, len(argFacts) > 0
+}
+
+func traceToParams(fn *ssa.Function, startInstr ssa.Instruction, startFact ssa.Value, localRet map[*ssa.Function]*ReturnToParamFact, pass *analysis.Pass) []int {
+	startPoint := getInstructionPoint(startInstr)
+	visited := make(map[traceNode]bool)
+	worklist := []traceNode{{Point: startPoint, Fact: startFact}}
+	paramsReached := make(map[int]bool)
+
+	for len(worklist) > 0 {
+		node := worklist[0]
+		worklist = worklist[1:]
+
+		if node.Fact == nil || visited[node] {
+			continue
+		}
+		visited[node] = true
+
+		d2 := node.Fact
+		if param, ok := d2.(*ssa.Parameter); ok {
+			if idx := indexOfParam(fn, param); idx >= 0 {
+				paramsReached[idx] = true
+			}
+			continue
+		}
+		if _, isConst := d2.(*ssa.Const); isConst {
+			continue
+		}
+
+		if callPoint, argFacts, jumped := applyCrossPackageSummary(d2, localRet, pass); jumped {
+			for _, argFact := range argFacts {
+				worklist = append(worklist, traceNode{Point: callPoint, Fact: argFact})
+			}
+			continue
+		}
+
+		v2 := node.Point
+		instr := v2.Block.Instrs[v2.Index]
+
+		if callInstr, ok := instr.(ssa.CallInstruction); ok {
+			for _, nd2 := range applyCallToReturn(callInstr, d2) {
+				for _, prevPoint := range getPredecessors(v2) {
+					worklist = append(worklist, traceNode{Point: prevPoint, Fact: nd2})
+				}
+			}
+		} else if isEntryNode(v2) {
+			for paramIdx, param := range fn.Params {
+				if param == d2 {
+					paramsReached[paramIdx] = true
+				}
+			}
+		} else {
+			for _, nd2 := range applyNormalFlow(instr, d2) {
+				for _, prevPoint := range getPredecessors(v2) {
+					worklist = append(worklist, traceNode{Point: prevPoint, Fact: nd2})
+				}
+			}
+		}
+	}
+
+	var res []int
+	for p := range paramsReached {
+		res = append(res, p)
+	}
+	return res
+}
+
 func buildReturnFact(fn *ssa.Function, localRet map[*ssa.Function]*ReturnToParamFact, pass *analysis.Pass) *ReturnToParamFact {
 	resMap := make(map[int][]int)
-	tracer := NewIFDSTracer(fn, localRet, pass)
 
 	for _, b := range fn.Blocks {
 		for _, instr := range b.Instrs {
 			if ret, ok := instr.(*ssa.Return); ok {
 				for retIdx, retVal := range ret.Results {
-					paramsReached, _ := tracer.Tabulate(ret, retVal, nil)
+					paramsReached := traceToParams(fn, ret, retVal, localRet, pass)
 					if len(paramsReached) > 0 {
 						resMap[retIdx] = append(resMap[retIdx], paramsReached...)
 					}
@@ -74,7 +220,6 @@ func buildReturnFact(fn *ssa.Function, localRet map[*ssa.Function]*ReturnToParam
 
 func buildSinkFact(fn *ssa.Function, localSinks map[*ssa.Function]*SinkParamFact, localRet map[*ssa.Function]*ReturnToParamFact, pass *analysis.Pass) *SinkParamFact {
 	sinkParams := make(map[int]bool)
-	tracer := NewIFDSTracer(fn, localRet, pass)
 
 	for _, b := range fn.Blocks {
 		for _, instr := range b.Instrs {
@@ -90,8 +235,7 @@ func buildSinkFact(fn *ssa.Function, localSinks map[*ssa.Function]*SinkParamFact
 				}
 				argVal := call.Common().Args[sinkArgIdx]
 
-				paramsReached, _ := tracer.Tabulate(call.(ssa.Instruction), argVal, nil)
-				for _, pIdx := range paramsReached {
+				for _, pIdx := range traceToParams(fn, call.(ssa.Instruction), argVal, localRet, pass) {
 					sinkParams[pIdx] = true
 				}
 			}
@@ -108,74 +252,6 @@ func buildSinkFact(fn *ssa.Function, localSinks map[*ssa.Function]*SinkParamFact
 	return &SinkParamFact{SinkIndices: res}
 }
 
-func isLoopIterator(val ssa.Value, loopRanges []LoopRange) bool {
-	switch t := val.(type) {
-	case *ssa.Extract:
-		if _, isNext := t.Tuple.(*ssa.Next); isNext {
-			return isInLoopBounds(t.Pos(), loopRanges) || isInLoopBounds(t.Parent().Pos(), loopRanges)
-		}
-	case *ssa.Next:
-		return true
-	case *ssa.Phi:
-		return isInLoopBounds(t.Pos(), loopRanges)
-
-	case *ssa.IndexAddr:
-		// Resolve t.Index if it's a BinOp (like i + 1) or directly a Phi node
-		return isLoopIndexValue(t.Index, loopRanges)
-	}
-	return false
-}
-
-// Helper to trace the index operand back to the loop-bound Phi node
-func isLoopIndexValue(val ssa.Value, loopRanges []LoopRange) bool {
-	if val == nil {
-		return false
-	}
-
-	switch v := val.(type) {
-	case *ssa.Phi:
-		block := v.Block()
-		if block == nil {
-			return false
-		}
-
-		// 1. Try the current block first (for standard `for i := 0; ...` loops)
-		for _, instr := range block.Instrs {
-			if instr.Pos().IsValid() {
-				if isInLoopBounds(instr.Pos(), loopRanges) {
-					return true
-				}
-				break // We found the location of this block, no need to keep checking it
-			}
-		}
-
-		// 2. SYNTHETIC BLOCK FALLBACK: Check Successor Blocks (for `range` loops)
-		// If the header is synthetic (token.NoPos), we peek at where it branches.
-		// One branch goes to the loop body, which WILL have a valid position.
-		for _, succ := range block.Succs {
-			for _, instr := range succ.Instrs {
-				if instr.Pos().IsValid() {
-					if isInLoopBounds(instr.Pos(), loopRanges) {
-						return true
-					}
-					break // Move on to the next successor block
-				}
-			}
-		}
-
-		return false
-
-	case *ssa.BinOp:
-		// Follow both sides (e.g., i + 1)
-		return isLoopIndexValue(v.X, loopRanges) || isLoopIndexValue(v.Y, loopRanges)
-
-	case *ssa.Convert:
-		// Strip type conversions
-		return isLoopIndexValue(v.X, loopRanges)
-	}
-
-	return false
-}
 func getCallSinkIndices(call ssa.CallInstruction, localSinks map[*ssa.Function]*SinkParamFact, pass *analysis.Pass) []int {
 	name := ""
 	if call.Common().Method != nil {

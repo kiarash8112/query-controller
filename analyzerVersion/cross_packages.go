@@ -48,17 +48,15 @@ func createCrossPackageFacts(pass *analysis.Pass) (map[*ssa.Function]*SinkParamF
 	}
 
 	// Step C: Export Facts
-	isTestEnv := pass.Pkg.Name() != "main" && (pass.Pkg.Path() == "todo" || pass.Pkg.Path() == "testdata")
-	if !isTestEnv {
-		for _, fn := range funcs {
-			obj := fn.Object()
-			if obj != nil {
-				if sf, ok := localSinkFacts[fn]; ok && sf != nil {
-					pass.ExportObjectFact(obj, sf)
-				}
-				if rf, ok := localReturnFacts[fn]; ok && rf != nil {
-					pass.ExportObjectFact(obj, rf)
-				}
+
+	for _, fn := range funcs {
+		obj := fn.Object()
+		if obj != nil {
+			if sf, ok := localSinkFacts[fn]; ok && sf != nil {
+				pass.ExportObjectFact(obj, sf)
+			}
+			if rf, ok := localReturnFacts[fn]; ok && rf != nil {
+				pass.ExportObjectFact(obj, rf)
 			}
 		}
 	}
