@@ -28,20 +28,27 @@ func createCrossPackageFacts(pass *analysis.Pass) (map[*ssa.Function]*SinkParamF
 	localReturnFacts := make(map[*ssa.Function]*ReturnToParamFact)
 
 	funcs := ssaResult.SrcFuncs
-	// Step B: Build intra-package Facts
 	changed := true
 	for iterations := 0; changed && iterations < 10; iterations++ {
 		changed = false
+
 		for _, fn := range funcs {
 			newRetFact := buildReturnFact(fn, localReturnFacts, pass)
 			if !reflect.DeepEqual(localReturnFacts[fn], newRetFact) {
 				localReturnFacts[fn] = newRetFact
 				changed = true
 			}
+		}
 
-			newSinkFact := buildSinkFact(fn, localSinkFacts, localReturnFacts, pass)
-			if !reflect.DeepEqual(localSinkFacts[fn], newSinkFact) {
-				localSinkFacts[fn] = newSinkFact
+		directSinkFacts := make(map[*ssa.Function]*SinkParamFact, len(funcs))
+		for _, fn := range funcs {
+			directSinkFacts[fn] = buildDirectSinkFact(fn, localReturnFacts, pass)
+		}
+
+		newSinkFacts := propagateSinkToPackageCallers(funcs, directSinkFacts, localReturnFacts, pass)
+		for _, fn := range funcs {
+			if !reflect.DeepEqual(localSinkFacts[fn], newSinkFacts[fn]) {
+				localSinkFacts[fn] = newSinkFacts[fn]
 				changed = true
 			}
 		}

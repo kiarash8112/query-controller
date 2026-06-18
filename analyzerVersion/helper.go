@@ -2,6 +2,8 @@ package linters
 
 import (
 	"go/token"
+	"go/types"
+	"reflect"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ssa"
@@ -90,6 +92,149 @@ func getReturnFact(callee *ssa.Function, localRet map[*ssa.Function]*ReturnToPar
 		}
 	}
 	return nil
+}
+
+func getSinkFact(callee *ssa.Function, localSinks map[*ssa.Function]*SinkParamFact, pass *analysis.Pass) *SinkParamFact {
+	if callee == nil {
+		return nil
+	}
+	if sf, ok := localSinks[callee]; ok {
+		return sf
+	}
+	if obj := callee.Object(); obj != nil {
+		var exportedFact SinkParamFact
+		if pass.ImportObjectFact(obj, &exportedFact) {
+			return &exportedFact
+		}
+	}
+	return nil
+}
+
+func getPackageCallers(fn *ssa.Function, funcs []*ssa.Function) []ssa.CallInstruction {
+	var callers []ssa.CallInstruction
+	for _, cFn := range funcs {
+		for _, b := range cFn.Blocks {
+			for _, inst := range b.Instrs {
+				if callInst, ok := inst.(ssa.CallInstruction); ok && callInst.Common().StaticCallee() == fn {
+					callers = append(callers, callInst)
+				}
+			}
+		}
+	}
+	return callers
+}
+
+func mergeSinkFacts(a, b *SinkParamFact) *SinkParamFact {
+	if a == nil && b == nil {
+		return nil
+	}
+	indices := make(map[int]bool)
+	for _, sf := range []*SinkParamFact{a, b} {
+		if sf == nil {
+			continue
+		}
+		for _, idx := range sf.SinkIndices {
+			indices[idx] = true
+		}
+	}
+	if len(indices) == 0 {
+		return nil
+	}
+	var res []int
+	for idx := range indices {
+		res = append(res, idx)
+	}
+	return &SinkParamFact{SinkIndices: res}
+}
+
+func sinkFactFromParams(params map[int]bool) *SinkParamFact {
+	if len(params) == 0 {
+		return nil
+	}
+	var res []int
+	for pIdx := range params {
+		res = append(res, pIdx)
+	}
+	return &SinkParamFact{SinkIndices: res}
+}
+
+func buildDirectSinkFact(fn *ssa.Function, localRet map[*ssa.Function]*ReturnToParamFact, pass *analysis.Pass) *SinkParamFact {
+	sinkParams := make(map[int]bool)
+
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			call, ok := instr.(ssa.CallInstruction)
+			if !ok {
+				continue
+			}
+
+			for _, sinkArgIdx := range getDirectSinkArgIndices(call) {
+				if sinkArgIdx >= len(call.Common().Args) {
+					continue
+				}
+				argVal := call.Common().Args[sinkArgIdx]
+				for _, pIdx := range traceToParams(fn, call.(ssa.Instruction), argVal, localRet, pass) {
+					sinkParams[pIdx] = true
+				}
+			}
+		}
+	}
+	return sinkFactFromParams(sinkParams)
+}
+
+func sinkFactAtCallSite(
+	callerFn *ssa.Function,
+	call ssa.CallInstruction,
+	calleeSinkParamIndices []int,
+	localRet map[*ssa.Function]*ReturnToParamFact,
+	pass *analysis.Pass,
+) *SinkParamFact {
+	sinkParams := make(map[int]bool)
+	for _, paramIdx := range calleeSinkParamIndices {
+		if paramIdx >= len(call.Common().Args) {
+			continue
+		}
+		argVal := call.Common().Args[paramIdx]
+		for _, pIdx := range traceToParams(callerFn, call.(ssa.Instruction), argVal, localRet, pass) {
+			sinkParams[pIdx] = true
+		}
+	}
+	return sinkFactFromParams(sinkParams)
+}
+
+func propagateSinkToPackageCallers(
+	funcs []*ssa.Function,
+	sinkFacts map[*ssa.Function]*SinkParamFact,
+	localRet map[*ssa.Function]*ReturnToParamFact,
+	pass *analysis.Pass,
+) map[*ssa.Function]*SinkParamFact {
+	result := make(map[*ssa.Function]*SinkParamFact, len(funcs))
+	for fn, sf := range sinkFacts {
+		result[fn] = sf
+	}
+
+	for {
+		changed := false
+		for _, sinkFn := range funcs {
+			sf := result[sinkFn]
+			if sf == nil || len(sf.SinkIndices) == 0 {
+				continue
+			}
+			for _, caller := range getPackageCallers(sinkFn, funcs) {
+				callerFn := caller.Block().Parent()
+				atCall := sinkFactAtCallSite(callerFn, caller, sf.SinkIndices, localRet, pass)
+				merged := mergeSinkFacts(result[callerFn], atCall)
+				if !reflect.DeepEqual(result[callerFn], merged) {
+					result[callerFn] = merged
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return result
 }
 
 func resolveCallResult(fact ssa.Value) (*ssa.Call, int, bool) {
@@ -218,41 +363,7 @@ func buildReturnFact(fn *ssa.Function, localRet map[*ssa.Function]*ReturnToParam
 	return &ReturnToParamFact{ResultToParams: resMap}
 }
 
-func buildSinkFact(fn *ssa.Function, localSinks map[*ssa.Function]*SinkParamFact, localRet map[*ssa.Function]*ReturnToParamFact, pass *analysis.Pass) *SinkParamFact {
-	sinkParams := make(map[int]bool)
-
-	for _, b := range fn.Blocks {
-		for _, instr := range b.Instrs {
-			call, ok := instr.(ssa.CallInstruction)
-			if !ok {
-				continue
-			}
-
-			sinkIndices := getCallSinkIndices(call, localSinks, pass)
-			for _, sinkArgIdx := range sinkIndices {
-				if sinkArgIdx >= len(call.Common().Args) {
-					continue
-				}
-				argVal := call.Common().Args[sinkArgIdx]
-
-				for _, pIdx := range traceToParams(fn, call.(ssa.Instruction), argVal, localRet, pass) {
-					sinkParams[pIdx] = true
-				}
-			}
-		}
-	}
-	if len(sinkParams) == 0 {
-		return nil
-	}
-
-	var res []int
-	for pIdx := range sinkParams {
-		res = append(res, pIdx)
-	}
-	return &SinkParamFact{SinkIndices: res}
-}
-
-func getCallSinkIndices(call ssa.CallInstruction, localSinks map[*ssa.Function]*SinkParamFact, pass *analysis.Pass) []int {
+func getDirectSinkArgIndices(call ssa.CallInstruction) []int {
 	name := ""
 	if call.Common().Method != nil {
 		name = call.Common().Method.Name()
@@ -260,28 +371,28 @@ func getCallSinkIndices(call ssa.CallInstruction, localSinks map[*ssa.Function]*
 		name = callee.Name()
 	}
 
-	if isExecutionMethod(name) {
-		var args []int
-		for i := range call.Common().Args {
-			args = append(args, i)
-		}
-		if len(args) > 1 {
-			return args[1:]
-		}
-		return args
+	if !isExecutionMethod(name) {
+		return nil
+	}
+
+	var args []int
+	for i := range call.Common().Args {
+		args = append(args, i)
+	}
+	if len(args) > 1 {
+		return args[1:]
+	}
+	return args
+}
+
+func getCallSinkIndices(call ssa.CallInstruction, localSinks map[*ssa.Function]*SinkParamFact, pass *analysis.Pass) []int {
+	if indices := getDirectSinkArgIndices(call); len(indices) > 0 {
+		return indices
 	}
 
 	callee := call.Common().StaticCallee()
-	if callee != nil {
-		if sf, ok := localSinks[callee]; ok && sf != nil {
-			return sf.SinkIndices
-		}
-		if obj := callee.Object(); obj != nil {
-			var expSink SinkParamFact
-			if pass.ImportObjectFact(obj, &expSink) {
-				return expSink.SinkIndices
-			}
-		}
+	if sf := getSinkFact(callee, localSinks, pass); sf != nil {
+		return sf.SinkIndices
 	}
 	return nil
 }
@@ -303,14 +414,83 @@ func indexOfParam(fn *ssa.Function, p *ssa.Parameter) int {
 	return -1
 }
 
-func isInLoopBounds(pos token.Pos, loopRanges []LoopRange) bool {
+func isInLoopBounds(pos token.Pos, loops []LoopInfo) bool {
 	if !pos.IsValid() {
 		return false
 	}
-	for _, lr := range loopRanges {
+	for _, lr := range loops {
 		if pos >= lr.Start && pos <= lr.End {
 			return true
 		}
 	}
 	return false
+}
+
+func programPointPos(p ProgramPoint) token.Pos {
+	if p.Index < 0 || p.Index >= len(p.Block.Instrs) {
+		return token.NoPos
+	}
+	return p.Block.Instrs[p.Index].Pos()
+}
+
+func innermostLoopFor(pos token.Pos, loops []LoopInfo) *LoopInfo {
+	if !pos.IsValid() {
+		return nil
+	}
+	var best *LoopInfo
+	bestSpan := -1
+	for i := range loops {
+		l := &loops[i]
+		if pos >= l.Start && pos <= l.End {
+			span := int(l.End - l.Start)
+			if best == nil || span < bestSpan {
+				best = l
+				bestSpan = span
+			}
+		}
+	}
+	return best
+}
+
+func factDerivesFromRangeCollection(fact, rangeValue ssa.Value) bool {
+	if fact == nil || rangeValue == nil {
+		return false
+	}
+	if fact == rangeValue {
+		return true
+	}
+	if factObj, rangeObj := valueObject(fact), valueObject(rangeValue); factObj != nil && factObj == rangeObj {
+		return true
+	}
+	if phi, ok := fact.(*ssa.Phi); ok {
+		for _, edge := range phi.Edges {
+			if factDerivesFromRangeCollection(edge, rangeValue) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func valueObject(v ssa.Value) types.Object {
+	switch val := v.(type) {
+	case *ssa.Global:
+		return val.Object()
+	case *ssa.Parameter:
+		return val.Object()
+	}
+	return nil
+}
+
+func reportNPlusOneAtSink(pass *analysis.Pass, sink ExplodedNode, reported map[token.Pos]bool) {
+	pos := programPointPos(sink.Point)
+	if !pos.IsValid() || reported[pos] {
+		return
+	}
+	reported[pos] = true
+	pass.Report(analysis.Diagnostic{
+		Pos:      pos,
+		Message:  "🚨 [TRUE N+1] Found dynamic database execution in loop (detected via dataflow)",
+		Category: "nplusone",
+	})
 }
