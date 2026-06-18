@@ -23,11 +23,12 @@ func Phase1_Tabulation(
 	funcs []*ssa.Function,
 	localSinkFacts map[*ssa.Function]*SinkParamFact,
 	localReturnFacts map[*ssa.Function]*ReturnToParamFact,
+	loopInfos []LoopInfo,
 	pass *analysis.Pass,
-) map[token.Pos][]ssa.Value {
+) {
 	P_set := make(map[PathEdge]bool)
 	var worklist []PathEdge
-	allResolutions := make(map[token.Pos][]ssa.Value)
+	reported := make(map[token.Pos]bool)
 
 	addPathEdge := func(edge PathEdge) {
 		if !P_set[edge] {
@@ -46,14 +47,14 @@ func Phase1_Tabulation(
 				if !ok {
 					continue
 				}
+				if !isInLoopBounds(call.Pos(), loopInfos) {
+					continue
+				}
 				for _, sinkArgIdx := range getCallSinkIndices(call, localSinkFacts, pass) {
 					if sinkArgIdx >= len(call.Common().Args) {
 						continue
 					}
 					val := call.Common().Args[sinkArgIdx]
-					if call.Pos().IsValid() {
-						allResolutions[call.Pos()] = append(allResolutions[call.Pos()], val)
-					}
 					sink := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
 					addPathEdge(PathEdge{Start: sink, End: sink})
 				}
@@ -95,68 +96,24 @@ func Phase1_Tabulation(
 					})
 				}
 			}
-		} else if isEntryNode(v2) {
-			fn := v2.Block.Parent()
-			for paramIdx, param := range fn.Params {
-				if param != d2 {
-					continue
-				}
-				for _, caller := range getPackageCallers(fn, funcs) {
-					if paramIdx >= len(caller.Common().Args) {
-						continue
-					}
-					arg := caller.Common().Args[paramIdx]
-					if caller.Pos().IsValid() {
-						allResolutions[caller.Pos()] = append(allResolutions[caller.Pos()], arg)
-					}
-					callerPoint := getInstructionPoint(caller)
-					for _, prevPoint := range getPredecessors(callerPoint) {
-						addPathEdge(PathEdge{
-							Start: ExplodedNode{Point: prevPoint, Fact: arg},
-							End:   ExplodedNode{Point: prevPoint, Fact: arg},
-						})
-					}
-				}
-			}
 		} else {
 			for _, nd2 := range applyNormalFlow(instr, d2) {
 				for _, prevPoint := range getPredecessors(v2) {
+					v2Pos := instr.Pos()
+					prevPos := programPointPos(prevPoint)
+					if isInLoopBounds(v2Pos, loopInfos) && !isInLoopBounds(prevPos, loopInfos) {
+						if loop := innermostLoopFor(programPointPos(edge.Start.Point), loopInfos); loop != nil {
+							if factDerivesFromRangeCollection(nd2, loop.RangeValue) {
+								reportNPlusOneAtSink(pass, edge.Start, reported)
+							}
+						}
+					}
 					addPathEdge(PathEdge{
 						Start: edge.Start,
 						End:   ExplodedNode{Point: prevPoint, Fact: nd2},
 					})
 				}
 			}
-		}
-	}
-
-	return allResolutions
-}
-
-func verifyNPlusOne(
-	pass *analysis.Pass,
-	allResolutions map[token.Pos][]ssa.Value,
-	loopRanges []LoopRange,
-) {
-	for pos, resolvedArgs := range allResolutions {
-		if !isInLoopBounds(pos, loopRanges) {
-			continue
-		}
-
-		isDynamic := false
-		for _, arg := range resolvedArgs {
-			if _, isConst := arg.(*ssa.Const); !isConst {
-				isDynamic = true
-				break
-			}
-		}
-
-		if isDynamic {
-			pass.Report(analysis.Diagnostic{
-				Pos:      pos,
-				Message:  "🚨 [TRUE N+1] Found dynamic database execution in loop (detected via dataflow)",
-				Category: "nplusone",
-			})
 		}
 	}
 }

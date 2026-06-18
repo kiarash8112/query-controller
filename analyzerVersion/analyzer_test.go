@@ -36,6 +36,31 @@ func TestDynamicBuild(t *testing.T) {
 	analysistest.Run(t, testdataDir(t), analyzers[0], "dynamic_build/code.go")
 }
 
+func TestNestedFunction(t *testing.T) {
+	newPlugin, err := register.GetPlugin("nplusone")
+	require.NoError(t, err)
+
+	plugin, err := newPlugin(nil)
+	require.NoError(t, err)
+
+	analyzers, err := plugin.BuildAnalyzers()
+	require.NoError(t, err)
+
+	analysistest.Run(t, testdataDir(t), analyzers[0], "nested_function/example.go")
+}
+
+func TestStateChecking(t *testing.T) {
+	newPlugin, err := register.GetPlugin("nplusone")
+	require.NoError(t, err)
+
+	plugin, err := newPlugin(nil)
+	require.NoError(t, err)
+
+	analyzers, err := plugin.BuildAnalyzers()
+	require.NoError(t, err)
+
+	analysistest.Run(t, testdataDir(t), analyzers[0], "state_checking/example.go")
+}
 
 func testdataDir(t *testing.T) string {
 	t.Helper()
