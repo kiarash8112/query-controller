@@ -1,12 +1,14 @@
 package linters
 
 import (
+	"go/token"
+
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ssa"
 )
 
 type ExplodedNode struct {
-	Instr ssa.Instruction
+	Point ProgramPoint
 	Fact  ssa.Value
 }
 
@@ -15,127 +17,146 @@ type PathEdge struct {
 	End   ExplodedNode
 }
 
-type IFDSTracer struct {
-	fn       *ssa.Function
-	localRet map[*ssa.Function]*ReturnToParamFact
-	pass     *analysis.Pass
+// Phase1_Tabulation seeds sink arguments and walks backward through normal flow.
+// Cross-package calls are resolved via ReturnToParamFact instead of a call stack.
+func Phase1_Tabulation(
+	funcs []*ssa.Function,
+	localSinkFacts map[*ssa.Function]*SinkParamFact,
+	localReturnFacts map[*ssa.Function]*ReturnToParamFact,
+	pass *analysis.Pass,
+) map[token.Pos][]ssa.Value {
+	P_set := make(map[PathEdge]bool)
+	var worklist []PathEdge
+	allResolutions := make(map[token.Pos][]ssa.Value)
 
-	P_set    map[PathEdge]bool
-	worklist []PathEdge
-}
-
-func NewIFDSTracer(fn *ssa.Function, localRet map[*ssa.Function]*ReturnToParamFact, pass *analysis.Pass) *IFDSTracer {
-	return &IFDSTracer{
-		fn:       fn,
-		localRet: localRet,
-		pass:     pass,
-		P_set:    make(map[PathEdge]bool),
-		worklist: make([]PathEdge, 0),
+	addPathEdge := func(edge PathEdge) {
+		if !P_set[edge] {
+			P_set[edge] = true
+			worklist = append(worklist, edge)
+		}
 	}
-}
 
-func (t *IFDSTracer) addPathEdge(edge PathEdge) {
-	if !t.P_set[edge] {
-		t.P_set[edge] = true
-		t.worklist = append(t.worklist, edge)
+	for _, fn := range funcs {
+		if fn.Synthetic != "" {
+			continue
+		}
+		for _, block := range fn.Blocks {
+			for i, instr := range block.Instrs {
+				call, ok := instr.(ssa.CallInstruction)
+				if !ok {
+					continue
+				}
+				for _, sinkArgIdx := range getCallSinkIndices(call, localSinkFacts, pass) {
+					if sinkArgIdx >= len(call.Common().Args) {
+						continue
+					}
+					val := call.Common().Args[sinkArgIdx]
+					if call.Pos().IsValid() {
+						allResolutions[call.Pos()] = append(allResolutions[call.Pos()], val)
+					}
+					sink := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
+					addPathEdge(PathEdge{Start: sink, End: sink})
+				}
+			}
+		}
 	}
-}
 
-// Tabulate runs the formal Worklist algorithm using PathEdges
-func (t *IFDSTracer) Tabulate(startInstr ssa.Instruction, startFact ssa.Value, loopRanges []LoopRange) ([]int, bool) {
-	startNode := ExplodedNode{Instr: startInstr, Fact: startFact}
-	t.addPathEdge(PathEdge{Start: startNode, End: startNode})
+	for len(worklist) > 0 {
+		edge := worklist[0]
+		worklist = worklist[1:]
 
-	hitLoop := false
-	paramsReached := make(map[int]bool)
-
-	for len(t.worklist) > 0 {
-		edge := t.worklist[0]
-		t.worklist = t.worklist[1:]
-
-		v2 := edge.End.Instr
+		v2 := edge.End.Point
 		d2 := edge.End.Fact
+		instr := v2.Block.Instrs[v2.Index]
 
 		if d2 == nil {
 			continue
 		}
-
-		// 1. Target Conditions
-		if isLoopIterator(d2, loopRanges) {
-			hitLoop = true
-			continue // Path terminates at vulnerability
-		}
-		if param, ok := d2.(*ssa.Parameter); ok {
-			if idx := indexOfParam(t.fn, param); idx >= 0 {
-				paramsReached[idx] = true
-			}
-			continue // Path terminates at function boundary
-		}
 		if _, isConst := d2.(*ssa.Const); isConst {
-			continue // Path terminates safely
+			continue
 		}
 
-		// 2. Data Flow Resolutions
-		if call, ok := d2.(*ssa.Call); ok {
+		if callPoint, argFacts, jumped := applyCrossPackageSummary(d2, localReturnFacts, pass); jumped {
+			for _, argFact := range argFacts {
+				addPathEdge(PathEdge{
+					Start: edge.Start,
+					End:   ExplodedNode{Point: callPoint, Fact: argFact},
+				})
+			}
+			continue
+		}
 
-			// --- CROSS-PACKAGE SUMMARY JUMP ---
-			// E.g., `id := pk1.getuserID(user)`
-			// We check if `pk1.getuserID` has an exported ReturnFact
-			retFact := t.getReturnFact(call.Call.StaticCallee())
-
-			if retFact != nil {
-				// We drop `id` and instantly create a PathEdge for `user` based on the Summary map
-				for _, mappedParams := range retFact.ResultToParams {
-					for _, pIdx := range mappedParams {
-						if pIdx < len(call.Call.Args) {
-							argFact := call.Call.Args[pIdx]
-							t.addPathEdge(PathEdge{
-								Start: edge.Start,
-								End:   ExplodedNode{Instr: call, Fact: argFact},
-							})
-						}
+		if callInstr, ok := instr.(ssa.CallInstruction); ok {
+			for _, nd2 := range applyCallToReturn(callInstr, d2) {
+				for _, prevPoint := range getPredecessors(v2) {
+					addPathEdge(PathEdge{
+						Start: edge.Start,
+						End:   ExplodedNode{Point: prevPoint, Fact: nd2},
+					})
+				}
+			}
+		} else if isEntryNode(v2) {
+			fn := v2.Block.Parent()
+			for paramIdx, param := range fn.Params {
+				if param != d2 {
+					continue
+				}
+				for _, caller := range getPackageCallers(fn, funcs) {
+					if paramIdx >= len(caller.Common().Args) {
+						continue
+					}
+					arg := caller.Common().Args[paramIdx]
+					if caller.Pos().IsValid() {
+						allResolutions[caller.Pos()] = append(allResolutions[caller.Pos()], arg)
+					}
+					callerPoint := getInstructionPoint(caller)
+					for _, prevPoint := range getPredecessors(callerPoint) {
+						addPathEdge(PathEdge{
+							Start: ExplodedNode{Point: prevPoint, Fact: arg},
+							End:   ExplodedNode{Point: prevPoint, Fact: arg},
+						})
 					}
 				}
-				continue
+			}
+		} else {
+			for _, nd2 := range applyNormalFlow(instr, d2) {
+				for _, prevPoint := range getPredecessors(v2) {
+					addPathEdge(PathEdge{
+						Start: edge.Start,
+						End:   ExplodedNode{Point: prevPoint, Fact: nd2},
+					})
+				}
+			}
+		}
+	}
+
+	return allResolutions
+}
+
+func verifyNPlusOne(
+	pass *analysis.Pass,
+	allResolutions map[token.Pos][]ssa.Value,
+	loopRanges []LoopRange,
+) {
+	for pos, resolvedArgs := range allResolutions {
+		if !isInLoopBounds(pos, loopRanges) {
+			continue
+		}
+
+		isDynamic := false
+		for _, arg := range resolvedArgs {
+			if _, isConst := arg.(*ssa.Const); !isConst {
+				isDynamic = true
+				break
 			}
 		}
 
-		// 3. Standard Instruction Flow
-		predecessors := getPredecessorFacts(d2)
-		for _, pFact := range predecessors {
-			var pInstr ssa.Instruction
-			if instr, isInstr := pFact.(ssa.Instruction); isInstr {
-				pInstr = instr // The predecessor value is an instruction itself
-			} else {
-				pInstr = v2 // Fallback to current context
-			}
-
-			t.addPathEdge(PathEdge{
-				Start: edge.Start,
-				End:   ExplodedNode{Instr: pInstr, Fact: pFact},
+		if isDynamic {
+			pass.Report(analysis.Diagnostic{
+				Pos:      pos,
+				Message:  "🚨 [TRUE N+1] Found dynamic database execution in loop (detected via dataflow)",
+				Category: "nplusone",
 			})
 		}
 	}
-
-	var res []int
-	for p := range paramsReached {
-		res = append(res, p)
-	}
-	return res, hitLoop
-}
-
-func (t *IFDSTracer) getReturnFact(callee *ssa.Function) *ReturnToParamFact {
-	if callee == nil {
-		return nil
-	}
-	if fr, ok := t.localRet[callee]; ok {
-		return fr
-	}
-	if obj := callee.Object(); obj != nil {
-		var exportedFact ReturnToParamFact
-		if t.pass.ImportObjectFact(obj, &exportedFact) {
-			return &exportedFact
-		}
-	}
-	return nil
 }
