@@ -167,11 +167,7 @@ func buildDirectSinkFact(fn *ssa.Function, localRet map[*ssa.Function]*ReturnToP
 				continue
 			}
 
-			for _, sinkArgIdx := range getDirectSinkArgIndices(call) {
-				if sinkArgIdx >= len(call.Common().Args) {
-					continue
-				}
-				argVal := call.Common().Args[sinkArgIdx]
+			for _, argVal := range getGormSinkArgs(call) {
 				for _, pIdx := range traceToParams(fn, call.(ssa.Instruction), argVal, localRet, pass) {
 					sinkParams[pIdx] = true
 				}
@@ -362,43 +358,87 @@ func buildReturnFact(fn *ssa.Function, localRet map[*ssa.Function]*ReturnToParam
 	return &ReturnToParamFact{ResultToParams: resMap}
 }
 
-func getDirectSinkArgIndices(call ssa.CallInstruction) []int {
-	name := ""
+func getCallNameFromInstr(call ssa.CallInstruction) string {
 	if call.Common().Method != nil {
-		name = call.Common().Method.Name()
-	} else if callee := call.Common().StaticCallee(); callee != nil {
-		name = callee.Name()
+		return call.Common().Method.Name()
 	}
-
-	if !isExecutionMethod(name) {
-		return nil
+	if callee := call.Common().StaticCallee(); callee != nil {
+		return callee.Name()
 	}
-
-	var args []int
-	for i := range call.Common().Args {
-		args = append(args, i)
-	}
-	if len(args) > 1 {
-		return args[1:]
-	}
-	return args
+	return ""
 }
 
-func getCallSinkIndices(call ssa.CallInstruction, localSinks map[*ssa.Function]*SinkParamFact, pass *analysis.Pass) []int {
-	if indices := getDirectSinkArgIndices(call); len(indices) > 0 {
-		return indices
+func buildTransitiveExecutors(funcs []*ssa.Function) map[string]bool {
+	execMap := make(map[*ssa.Function]bool)
+
+	for _, fn := range funcs {
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				if call, ok := instr.(ssa.CallInstruction); ok && isExecutionMethod(getCallNameFromInstr(call)) {
+					execMap[fn] = true
+				}
+			}
+		}
+	}
+
+	for changed := true; changed; {
+		changed = false
+		for _, fn := range funcs {
+			if execMap[fn] {
+				continue
+			}
+			for _, b := range fn.Blocks {
+				for _, instr := range b.Instrs {
+					if call, ok := instr.(ssa.CallInstruction); ok {
+						if callee := call.Common().StaticCallee(); callee != nil && execMap[callee] {
+							execMap[fn] = true
+							changed = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	names := make(map[string]bool)
+	for fn := range execMap {
+		names[fn.Name()] = true
+	}
+	return names
+}
+
+func getGormSinkArgs(call ssa.CallInstruction) []ssa.Value {
+	methodName := getCallNameFromInstr(call)
+	switch methodName {
+	case "Where", "Raw", "Not", "Or", "Select", "Having", "Group", "Order", "Query", "QueryRow", "Exec":
+		if len(call.Common().Args) > 1 {
+			return call.Common().Args[1:]
+		}
+	}
+	return nil
+}
+
+func getCallSinkArgs(call ssa.CallInstruction, localSinks map[*ssa.Function]*SinkParamFact, pass *analysis.Pass) []ssa.Value {
+	if args := getGormSinkArgs(call); len(args) > 0 {
+		return args
 	}
 
 	callee := call.Common().StaticCallee()
 	if sf := getSinkFact(callee, localSinks, pass); sf != nil {
-		return sf.SinkIndices
+		var vals []ssa.Value
+		for _, idx := range sf.SinkIndices {
+			if idx < len(call.Common().Args) {
+				vals = append(vals, call.Common().Args[idx])
+			}
+		}
+		return vals
 	}
 	return nil
 }
 
 func isExecutionMethod(name string) bool {
 	switch name {
-	case "Scan", "Find", "First", "Take", "Last", "Pluck", "Count", "Exec", "QueryRow", "Query", "Where", "Raw", "Not", "Or":
+	case "Scan", "Find", "First", "Take", "Last", "Pluck", "Count", "Exec", "QueryRow", "Query":
 		return true
 	}
 	return false
