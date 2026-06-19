@@ -87,33 +87,29 @@ func Phase1_Tabulation(
 			continue
 		}
 
-		if callInstr, ok := instr.(ssa.CallInstruction); ok {
-			for _, nd2 := range applyCallToReturn(callInstr, d2) {
-				for _, prevPoint := range getPredecessors(v2) {
-					addPathEdge(PathEdge{
-						Start: edge.Start,
-						End:   ExplodedNode{Point: prevPoint, Fact: nd2},
-					})
-				}
-			}
-		} else {
-			for _, nd2 := range applyNormalFlow(instr, d2) {
-				for _, prevPoint := range getPredecessors(v2) {
-					v2Pos := instr.Pos()
-					prevPos := programPointPos(prevPoint)
-					if isInLoopBounds(v2Pos, loopInfos) && !isInLoopBounds(prevPos, loopInfos) {
-						if loop := innermostLoopFor(programPointPos(edge.Start.Point), loopInfos); loop != nil {
-							if factDerivesFromRangeCollection(nd2, loop.RangeValue) {
-								reportNPlusOneAtSink(pass, edge.Start, reported)
-							}
-						}
+		// if callInstr, ok := instr.(ssa.CallInstruction); ok {
+		// 	for _, nd2 := range applyCallToReturn(callInstr, d2) {
+		// 		for _, prevPoint := range getPredecessors(v2) {
+		// 			addPathEdge(PathEdge{
+		// 				Start: edge.Start,
+		// 				End:   ExplodedNode{Point: prevPoint, Fact: nd2},
+		// 			})
+		// 		}
+		// 	}
+		// } else {
+		for _, nd2 := range applyNormalFlow(instr, d2) {
+			for _, prevPoint := range getPredecessors(v2) {
+				if loop := innermostLoopFor(programPointPos(edge.Start.Point), loopInfos); loop != nil {
+					if isLoopIndexedAccess(instr, d2, nd2) {
+						reportNPlusOneAtSink(pass, edge.Start, reported)
 					}
-					addPathEdge(PathEdge{
-						Start: edge.Start,
-						End:   ExplodedNode{Point: prevPoint, Fact: nd2},
-					})
 				}
+				addPathEdge(PathEdge{
+					Start: edge.Start,
+					End:   ExplodedNode{Point: prevPoint, Fact: nd2},
+				})
 			}
 		}
+
 	}
 }
