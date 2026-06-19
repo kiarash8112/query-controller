@@ -2,7 +2,6 @@ package linters
 
 import (
 	"go/token"
-	"go/types"
 	"reflect"
 
 	"golang.org/x/tools/go/analysis"
@@ -452,34 +451,41 @@ func innermostLoopFor(pos token.Pos, loops []LoopInfo) *LoopInfo {
 	return best
 }
 
-func factDerivesFromRangeCollection(fact, rangeValue ssa.Value) bool {
-	if fact == nil || rangeValue == nil {
+func isLoopIndexedAccess(instr ssa.Instruction, fact, nextFact ssa.Value) bool {
+	instrVal, ok := instr.(ssa.Value)
+	if !ok || instrVal != fact {
 		return false
 	}
-	if fact == rangeValue {
+
+	var index ssa.Value
+	switch val := instr.(type) {
+	case *ssa.IndexAddr:
+		index = val.Index
+	case *ssa.Index:
+		index = val.Index
+	default:
+		return false
+	}
+
+	return indexDependsOnPhi(index) || indexDependsOnPhi(nextFact)
+}
+
+func indexDependsOnPhi(v ssa.Value) bool {
+	if v == nil {
+		return false
+	}
+	if _, ok := v.(*ssa.Phi); ok {
 		return true
 	}
-	if factObj, rangeObj := valueObject(fact), valueObject(rangeValue); factObj != nil && factObj == rangeObj {
-		return true
-	}
-	if phi, ok := fact.(*ssa.Phi); ok {
-		for _, edge := range phi.Edges {
-			if factDerivesFromRangeCollection(edge, rangeValue) {
-				return true
-			}
+	if bin, ok := v.(*ssa.BinOp); ok {
+		if _, ok := bin.X.(*ssa.Phi); ok {
+			return true
+		}
+		if _, ok := bin.Y.(*ssa.Phi); ok {
+			return true
 		}
 	}
 	return false
-}
-
-func valueObject(v ssa.Value) types.Object {
-	switch val := v.(type) {
-	case *ssa.Global:
-		return val.Object()
-	case *ssa.Parameter:
-		return val.Object()
-	}
-	return nil
 }
 
 func reportNPlusOneAtSink(pass *analysis.Pass, sink ExplodedNode, reported map[token.Pos]bool) {
