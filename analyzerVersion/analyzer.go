@@ -26,15 +26,42 @@ type LoopInfo struct {
 	End   token.Pos
 }
 
-func collectLoopInfo(pass *analysis.Pass) []LoopInfo {
+func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
+	hasExecution := false
+	ast.Inspect(node, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		var name string
+		switch fun := call.Fun.(type) {
+		case *ast.SelectorExpr:
+			name = fun.Sel.Name
+		case *ast.Ident:
+			name = fun.Name
+		}
+		if isExecutionMethod(name) || executors[name] {
+			hasExecution = true
+			return false
+		}
+		return true
+	})
+	return hasExecution
+}
+
+func collectLoopInfo(pass *analysis.Pass, executors map[string]bool) []LoopInfo {
 	var loops []LoopInfo
 	for _, file := range pass.Files {
 		ast.Inspect(file, func(n ast.Node) bool {
 			switch loop := n.(type) {
 			case *ast.ForStmt:
-				loops = append(loops, LoopInfo{Start: loop.Pos(), End: loop.End()})
+				if astContainsExecutionMethod(loop.Body, executors) {
+					loops = append(loops, LoopInfo{Start: loop.Pos(), End: loop.End()})
+				}
 			case *ast.RangeStmt:
-				loops = append(loops, LoopInfo{Start: loop.Pos(), End: loop.End()})
+				if astContainsExecutionMethod(loop.Body, executors) {
+					loops = append(loops, LoopInfo{Start: loop.Pos(), End: loop.End()})
+				}
 			}
 			return true
 		})
@@ -46,7 +73,8 @@ func collectLoopInfo(pass *analysis.Pass) []LoopInfo {
 func run(pass *analysis.Pass) (any, error) {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	funcs := ssaResult.SrcFuncs
-	loopInfos := collectLoopInfo(pass)
+	executors := buildTransitiveExecutors(funcs)
+	loopInfos := collectLoopInfo(pass, executors)
 
 	localSinkFacts, localReturnFacts := createCrossPackageFacts(pass)
 

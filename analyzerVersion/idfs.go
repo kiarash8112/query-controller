@@ -50,11 +50,7 @@ func Phase1_Tabulation(
 				if !isInLoopBounds(call.Pos(), loopInfos) {
 					continue
 				}
-				for _, sinkArgIdx := range getCallSinkIndices(call, localSinkFacts, pass) {
-					if sinkArgIdx >= len(call.Common().Args) {
-						continue
-					}
-					val := call.Common().Args[sinkArgIdx]
+				for _, val := range getCallSinkArgs(call, localSinkFacts, pass) {
 					sink := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
 					addPathEdge(PathEdge{Start: sink, End: sink})
 				}
