@@ -54,8 +54,6 @@ func createCrossPackageFacts(pass *analysis.Pass) (map[*ssa.Function]*SinkParamF
 		}
 	}
 
-	// Step C: Export Facts
-
 	for _, fn := range funcs {
 		obj := fn.Object()
 		if obj != nil {

@@ -73,6 +73,7 @@ func collectLoopInfo(pass *analysis.Pass, executors map[string]bool) []LoopInfo 
 func run(pass *analysis.Pass) (any, error) {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	funcs := ssaResult.SrcFuncs
+
 	executors := buildTransitiveExecutors(funcs)
 	loopInfos := collectLoopInfo(pass, executors)
 
