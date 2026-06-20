@@ -3,6 +3,7 @@ package linters
 import (
 	"go/token"
 	"reflect"
+	"slices"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ssa"
@@ -84,6 +85,7 @@ func getReturnFact(callee *ssa.Function, localRet map[*ssa.Function]*ReturnToPar
 	if fr, ok := localRet[callee]; ok {
 		return fr
 	}
+	//todo: is possible to see callee in same package that has not be ready yet ?
 	if obj := callee.Object(); obj != nil {
 		var exportedFact ReturnToParamFact
 		if pass.ImportObjectFact(obj, &exportedFact) {
@@ -123,6 +125,18 @@ func getPackageCallers(fn *ssa.Function, funcs []*ssa.Function) []ssa.CallInstru
 	return callers
 }
 
+func sortedSinkIndices(indices map[int]bool) []int {
+	if len(indices) == 0 {
+		return nil
+	}
+	res := make([]int, 0, len(indices))
+	for idx := range indices {
+		res = append(res, idx)
+	}
+	slices.Sort(res)
+	return res
+}
+
 func mergeSinkFacts(a, b *SinkParamFact) *SinkParamFact {
 	if a == nil && b == nil {
 		return nil
@@ -136,23 +150,17 @@ func mergeSinkFacts(a, b *SinkParamFact) *SinkParamFact {
 			indices[idx] = true
 		}
 	}
-	if len(indices) == 0 {
+	res := sortedSinkIndices(indices)
+	if res == nil {
 		return nil
-	}
-	var res []int
-	for idx := range indices {
-		res = append(res, idx)
 	}
 	return &SinkParamFact{SinkIndices: res}
 }
 
 func sinkFactFromParams(params map[int]bool) *SinkParamFact {
-	if len(params) == 0 {
+	res := sortedSinkIndices(params)
+	if res == nil {
 		return nil
-	}
-	var res []int
-	for pIdx := range params {
-		res = append(res, pIdx)
 	}
 	return &SinkParamFact{SinkIndices: res}
 }
