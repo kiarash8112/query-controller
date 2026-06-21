@@ -339,6 +339,53 @@ func applyCrossPackageSummary(
 	return callPoint, argFacts, len(argFacts) > 0
 }
 
+func tryMarkParam(fn *ssa.Function, v ssa.Value, paramsReached map[int]bool) {
+	param, ok := v.(*ssa.Parameter)
+	if !ok {
+		return
+	}
+	if idx := indexOfParam(fn, param); idx >= 0 {
+		paramsReached[idx] = true
+	}
+}
+
+func compositeValueOperands(v ssa.Value) ([]ssa.Value, bool) {
+	switch val := v.(type) {
+	case *ssa.IndexAddr:
+		return []ssa.Value{val.X, val.Index}, true
+	case *ssa.Index:
+		return []ssa.Value{val.X, val.Index}, true
+	case *ssa.FieldAddr:
+		return []ssa.Value{val.X}, true
+	case *ssa.Field:
+		return []ssa.Value{val.X}, true
+	case *ssa.Lookup:
+		return []ssa.Value{val.X, val.Index}, true
+	}
+	return nil, false
+}
+
+func spreadCompositeValue(fn *ssa.Function, d2 ssa.Value, point ProgramPoint, worklist *[]traceNode, paramsReached map[int]bool) bool {
+	operands, ok := compositeValueOperands(d2)
+	if !ok {
+		return false
+	}
+	if instr, ok := d2.(ssa.Instruction); ok {
+		point = getInstructionPoint(instr)
+	}
+	for _, op := range operands {
+		if _, isConst := op.(*ssa.Const); isConst {
+			continue
+		}
+		if _, isParam := op.(*ssa.Parameter); isParam {
+			tryMarkParam(fn, op, paramsReached)
+			continue
+		}
+		*worklist = append(*worklist, traceNode{Point: point, Fact: op})
+	}
+	return true
+}
+
 func traceToParams(fn *ssa.Function, startInstr ssa.Instruction, startFact ssa.Value, localRet map[*ssa.Function]*ReturnToParamFact, pass *analysis.Pass) []int {
 	startPoint := getInstructionPoint(startInstr)
 	visited := make(map[traceNode]bool)
@@ -382,11 +429,7 @@ func traceToParams(fn *ssa.Function, startInstr ssa.Instruction, startFact ssa.V
 				}
 			}
 		} else if isEntryNode(v2) {
-			for paramIdx, param := range fn.Params {
-				if param == d2 {
-					paramsReached[paramIdx] = true
-				}
-			}
+			spreadCompositeValue(fn, d2, v2, &worklist, paramsReached)
 		} else {
 			for _, nd2 := range applyNormalFlow(instr, d2) {
 				for _, prevPoint := range getPredecessors(v2) {
@@ -542,23 +585,22 @@ func innermostLoopFor(pos token.Pos, loops []LoopInfo) *LoopInfo {
 	return best
 }
 
-func isLoopIndexedAccess(instr ssa.Instruction, fact, nextFact ssa.Value) bool {
+func isLoopIndexedAccess(instr ssa.Instruction, fact ssa.Value) bool {
 	instrVal, ok := instr.(ssa.Value)
 	if !ok || instrVal != fact {
 		return false
 	}
 
-	var index ssa.Value
 	switch val := instr.(type) {
+	case *ssa.Phi:
+		return true
 	case *ssa.IndexAddr:
-		index = val.Index
+		return indexDependsOnPhi(val.Index)
 	case *ssa.Index:
-		index = val.Index
+		return indexDependsOnPhi(val.Index)
 	default:
 		return false
 	}
-
-	return indexDependsOnPhi(index) || indexDependsOnPhi(nextFact)
 }
 
 func indexDependsOnPhi(v ssa.Value) bool {
