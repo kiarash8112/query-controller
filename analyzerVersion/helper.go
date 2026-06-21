@@ -111,6 +111,64 @@ func getSinkFact(callee *ssa.Function, localSinks map[*ssa.Function]*SinkParamFa
 	return nil
 }
 
+func getExecutorFact(callee *ssa.Function, pass *analysis.Pass) bool {
+	if callee == nil {
+		return false
+	}
+	obj := callee.Object()
+	if obj == nil {
+		return false
+	}
+	var fact ExecutorFact
+	return pass.ImportObjectFact(obj, &fact)
+}
+
+func computeExecutorSet(funcs []*ssa.Function, pass *analysis.Pass) map[*ssa.Function]bool {
+	execMap := make(map[*ssa.Function]bool)
+
+	for _, fn := range funcs {
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				call, ok := instr.(ssa.CallInstruction)
+				if !ok {
+					continue
+				}
+				if isExecutionMethod(getCallNameFromInstr(call)) {
+					execMap[fn] = true
+					continue
+				}
+				if callee := call.Common().StaticCallee(); callee != nil && getExecutorFact(callee, pass) {
+					execMap[fn] = true
+				}
+			}
+		}
+	}
+
+	for changed := true; changed; {
+		changed = false
+		for _, fn := range funcs {
+			if execMap[fn] {
+				continue
+			}
+			for _, b := range fn.Blocks {
+				for _, instr := range b.Instrs {
+					call, ok := instr.(ssa.CallInstruction)
+					if !ok {
+						continue
+					}
+					callee := call.Common().StaticCallee()
+					if callee != nil && execMap[callee] {
+						execMap[fn] = true
+						changed = true
+					}
+				}
+			}
+		}
+	}
+
+	return execMap
+}
+
 func getPackageCallers(fn *ssa.Function, funcs []*ssa.Function) []ssa.CallInstruction {
 	var callers []ssa.CallInstruction
 	for _, cFn := range funcs {
@@ -376,41 +434,26 @@ func getCallNameFromInstr(call ssa.CallInstruction) string {
 	return ""
 }
 
-func buildTransitiveExecutors(funcs []*ssa.Function) map[string]bool {
-	execMap := make(map[*ssa.Function]bool)
-
-	for _, fn := range funcs {
-		for _, b := range fn.Blocks {
-			for _, instr := range b.Instrs {
-				if call, ok := instr.(ssa.CallInstruction); ok && isExecutionMethod(getCallNameFromInstr(call)) {
-					execMap[fn] = true
-				}
-			}
-		}
-	}
-
-	for changed := true; changed; {
-		changed = false
-		for _, fn := range funcs {
-			if execMap[fn] {
-				continue
-			}
-			for _, b := range fn.Blocks {
-				for _, instr := range b.Instrs {
-					if call, ok := instr.(ssa.CallInstruction); ok {
-						if callee := call.Common().StaticCallee(); callee != nil && execMap[callee] {
-							execMap[fn] = true
-							changed = true
-						}
-					}
-				}
-			}
-		}
-	}
+func buildTransitiveExecutors(funcs []*ssa.Function, pass *analysis.Pass) map[string]bool {
+	execMap := computeExecutorSet(funcs, pass)
 
 	names := make(map[string]bool)
 	for fn := range execMap {
 		names[fn.Name()] = true
+	}
+	for _, fn := range funcs {
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				call, ok := instr.(ssa.CallInstruction)
+				if !ok {
+					continue
+				}
+				callee := call.Common().StaticCallee()
+				if callee != nil && getExecutorFact(callee, pass) {
+					names[callee.Name()] = true
+				}
+			}
+		}
 	}
 	return names
 }
