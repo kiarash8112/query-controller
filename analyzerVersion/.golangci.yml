@@ -10,3 +10,9 @@ linters:
       nplusone:
         type: "module"
         description: This is an example usage of a plugin linter.
+run:
+  issues-exit-code: 1
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
