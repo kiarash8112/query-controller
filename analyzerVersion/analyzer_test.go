@@ -62,6 +62,19 @@ func TestStateChecking(t *testing.T) {
 	analysistest.Run(t, testdataDir(t), analyzers[0], "state_checking/example.go")
 }
 
+func TestTupleReturn(t *testing.T) {
+	newPlugin, err := register.GetPlugin("nplusone")
+	require.NoError(t, err)
+
+	plugin, err := newPlugin(nil)
+	require.NoError(t, err)
+
+	analyzers, err := plugin.BuildAnalyzers()
+	require.NoError(t, err)
+
+	analysistest.Run(t, testdataDir(t), analyzers[0], "tuplereturn/code.go")
+}
+
 func TestRecursion(t *testing.T) {
 	newPlugin, err := register.GetPlugin("nplusone")
 	require.NoError(t, err)
