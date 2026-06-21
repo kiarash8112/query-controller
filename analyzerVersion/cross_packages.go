@@ -22,6 +22,11 @@ type ReturnToParamFact struct {
 func (r *ReturnToParamFact) AFact()         {}
 func (r *ReturnToParamFact) String() string { return "ReturnToParamFact" }
 
+type ExecutorFact struct{}
+
+func (e *ExecutorFact) AFact()         {}
+func (e *ExecutorFact) String() string { return "ExecutorFact" }
+
 func createCrossPackageFacts(pass *analysis.Pass) (map[*ssa.Function]*SinkParamFact, map[*ssa.Function]*ReturnToParamFact) {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	localSinkFacts := make(map[*ssa.Function]*SinkParamFact)
@@ -54,6 +59,8 @@ func createCrossPackageFacts(pass *analysis.Pass) (map[*ssa.Function]*SinkParamF
 		}
 	}
 
+	executorSet := computeExecutorSet(funcs, pass)
+
 	for _, fn := range funcs {
 		obj := fn.Object()
 		if obj != nil {
@@ -62,6 +69,9 @@ func createCrossPackageFacts(pass *analysis.Pass) (map[*ssa.Function]*SinkParamF
 			}
 			if rf, ok := localReturnFacts[fn]; ok && rf != nil {
 				pass.ExportObjectFact(obj, rf)
+			}
+			if executorSet[fn] {
+				pass.ExportObjectFact(obj, &ExecutorFact{})
 			}
 		}
 	}

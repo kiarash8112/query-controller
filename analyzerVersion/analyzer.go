@@ -18,6 +18,7 @@ var Analyzer = &analysis.Analyzer{
 	FactTypes: []analysis.Fact{
 		new(SinkParamFact),
 		new(ReturnToParamFact),
+		new(ExecutorFact),
 	},
 }
 
@@ -74,7 +75,7 @@ func run(pass *analysis.Pass) (any, error) {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	funcs := ssaResult.SrcFuncs
 
-	executors := buildTransitiveExecutors(funcs)
+	executors := buildTransitiveExecutors(funcs, pass)
 	loopInfos := collectLoopInfo(pass, executors)
 
 	localSinkFacts, localReturnFacts := createCrossPackageFacts(pass)

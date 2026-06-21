@@ -1,0 +1,28 @@
+=== nplusone linter log started ===
+--- package: github.com/kiarash8112/querycontrolleranalyzer/code_examples/multi-package/product ---
+analyzing 3 SSA functions
+executors map: map[FetchProduct:true]
+found 0 loops with execution methods
+createCrossPackageFacts iteration 0
+  [localReturnFacts] github.com/kiarash8112/querycontrolleranalyzer/code_examples/multi-package/product.Where: nil -> ResultToParams=map[0:[0]]
+  [localReturnFacts] github.com/kiarash8112/querycontrolleranalyzer/code_examples/multi-package/product.Find: nil -> ResultToParams=map[0:[0]]
+  [localSinkFacts] github.com/kiarash8112/querycontrolleranalyzer/code_examples/multi-package/product.FetchProduct: nil -> SinkIndices=[0]
+createCrossPackageFacts iteration 1
+export ReturnToParamFact for github.com/kiarash8112/querycontrolleranalyzer/code_examples/multi-package/product.Where: ResultToParams=map[0:[0]]
+export ReturnToParamFact for github.com/kiarash8112/querycontrolleranalyzer/code_examples/multi-package/product.Find: ResultToParams=map[0:[0]]
+export SinkParamFact for github.com/kiarash8112/querycontrolleranalyzer/code_examples/multi-package/product.FetchProduct: SinkIndices=[0]
+export ExecutorFact for github.com/kiarash8112/querycontrolleranalyzer/code_examples/multi-package/product.FetchProduct
+starting Phase1_Tabulation
+Phase1_Tabulation seeded 0 sink path edges
+Phase1_Tabulation finished: 0 path edges, 0 N+1 reports
+finished Phase1_Tabulation
+--- package: github.com/kiarash8112/querycontrolleranalyzer/code_examples/multi-package ---
+analyzing 1 SSA functions
+executors map: map[FetchProduct:true GetPriceList:true]
+found 1 loops with execution methods
+createCrossPackageFacts iteration 0
+export ExecutorFact for github.com/kiarash8112/querycontrolleranalyzer/code_examples/multi-package.GetPriceList
+starting Phase1_Tabulation
+Phase1_Tabulation seeded 1 sink path edges
+Phase1_Tabulation finished: 26 path edges, 1 N+1 reports
+finished Phase1_Tabulation
