@@ -83,20 +83,10 @@ func Phase1_Tabulation(
 			continue
 		}
 
-		// if callInstr, ok := instr.(ssa.CallInstruction); ok {
-		// 	for _, nd2 := range applyCallToReturn(callInstr, d2) {
-		// 		for _, prevPoint := range getPredecessors(v2) {
-		// 			addPathEdge(PathEdge{
-		// 				Start: edge.Start,
-		// 				End:   ExplodedNode{Point: prevPoint, Fact: nd2},
-		// 			})
-		// 		}
-		// 	}
-		// } else {
 		for _, nd2 := range applyNormalFlow(instr, d2) {
 			for _, prevPoint := range getPredecessors(v2) {
 				if loop := innermostLoopFor(programPointPos(edge.Start.Point), loopInfos); loop != nil {
-					if isLoopIndexedAccess(instr, d2, nd2) {
+					if isLoopIndexedAccess(instr, d2) {
 						reportNPlusOneAtSink(pass, edge.Start, reported)
 					}
 				}

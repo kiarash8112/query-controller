@@ -15,10 +15,10 @@ func main() {
 	n := len(users)
 
 	for i := 0; i < n; i++ {
-		query(db, users, i)
+		fieldaddressinquery(db, users, i)
 	}
 }
 
-func query(db *GormDB, users []User, i int) {
+func fieldaddressinquery(db *GormDB, users []User, i int) {
 	db.Where("id = ?", users[i].name).Find(nil)
 }
