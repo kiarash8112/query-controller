@@ -1,4 +1,4 @@
-version: v2.4.0
+version: v2.12.2
 
 plugins:
   - module: github.com/kiarash8112/querycontrolleranalyzer
