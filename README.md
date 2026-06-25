@@ -4,6 +4,8 @@ Static analyzer for detecting **true, data-dependent N+1 database query** patter
 
 Unlike pattern matchers that flag any query inside a loop, Query Controller uses IFDS-style tabulation to distinguish real N+1 issues (loop-indexed or phi-dependent values flowing into query arguments) from safe constant queries.
 
+For architecture, algorithm details, and contributor onboarding, see [analyzerVersion/onboarding.md](analyzerVersion/onboarding.md).
+
 ## How it works
 
 Analysis runs in two phases:
@@ -31,6 +33,7 @@ Analysis runs in two phases:
 | `ifds.go`, `helper.go`, `ast.go`, `model.go` | Standalone CLI analyzer (stack-based IFDS) |
 | `examples/` | Sample Go packages used by the CLI |
 | `analyzerVersion/` | Production **golangci-lint plugin** with cross-package fact propagation |
+| `analyzerVersion/onboarding.md` | Architecture overview and contributor onboarding |
 | `analyzerVersion/code_examples/` | Test fixtures for the plugin |
 
 The root package is a research/prototype CLI. The `analyzerVersion/` directory is the maintained linter implementation with cross-package summaries (`SinkParamFact`, `ReturnToParamFact`, `ExecutorFact`) and golangci-lint integration.
