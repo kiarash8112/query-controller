@@ -8,12 +8,14 @@ import (
 	"golang.org/x/tools/go/analysis"
 
 	linters "github.com/kiarash8112/querycontrolleranalyzer"
+	sinks "github.com/kiarash8112/querycontrolleranalyzer/internal/sink_finding"
+	tracefunc "github.com/kiarash8112/querycontrolleranalyzer/internal/trace_function"
 )
 
 func init() {
 	register.Plugin("nplusone", New)
-	gob.Register(&linters.SinkParamFact{})
-	gob.Register(&linters.ReturnToParamFact{})
+	gob.Register(&sinks.SinkParamFact{})
+	gob.Register(&tracefunc.ReturnToParamFact{})
 }
 
 type nplusonePlugin struct{}

@@ -1,29 +1,21 @@
-package linters
+package data_flow
 
 import (
 	"go/token"
 
+	sinks "github.com/kiarash8112/querycontrolleranalyzer/internal/sink_finding"
+	tracefunc "github.com/kiarash8112/querycontrolleranalyzer/internal/trace_function"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ssa"
 )
-
-type ExplodedNode struct {
-	Point ProgramPoint
-	Fact  ssa.Value
-}
-
-type PathEdge struct {
-	Start ExplodedNode
-	End   ExplodedNode
-}
 
 // Phase1_Tabulation seeds sink arguments and walks backward through normal flow.
 // Cross-package calls are resolved via ReturnToParamFact instead of a call stack.
 func Phase1_Tabulation(
 	funcs []*ssa.Function,
-	localSinkFacts map[*ssa.Function]*SinkParamFact,
-	localReturnFacts map[*ssa.Function]*ReturnToParamFact,
-	loopInfos []LoopInfo,
+	localSinkFacts map[*ssa.Function]*sinks.SinkParamFact,
+	localReturnFacts map[*ssa.Function]*tracefunc.ReturnToParamFact,
+	loopInfos []sinks.LoopInfo,
 	pass *analysis.Pass,
 ) {
 	P_set := make(map[PathEdge]bool)
@@ -51,7 +43,7 @@ func Phase1_Tabulation(
 					continue
 				}
 				for _, val := range getCallSinkArgs(call, localSinkFacts, pass) {
-					sink := ExplodedNode{Point: ProgramPoint{Block: block, Index: i}, Fact: val}
+					sink := ExplodedNode{Point: tracefunc.ProgramPoint{Block: block, Index: i}, Fact: val}
 					addPathEdge(PathEdge{Start: sink, End: sink})
 				}
 			}
@@ -73,7 +65,7 @@ func Phase1_Tabulation(
 			continue
 		}
 
-		if callPoint, argFacts, jumped := applyCrossPackageSummary(d2, localReturnFacts, pass); jumped {
+		if callPoint, argFacts, jumped := tracefunc.ApplyCrossPackageSummary(d2, localReturnFacts, pass); jumped {
 			for _, argFact := range argFacts {
 				addPathEdge(PathEdge{
 					Start: edge.Start,
@@ -83,9 +75,9 @@ func Phase1_Tabulation(
 			continue
 		}
 
-		for _, nd2 := range applyNormalFlow(instr, d2) {
-			for _, prevPoint := range getPredecessors(v2) {
-				if loop := innermostLoopFor(programPointPos(edge.Start.Point), loopInfos); loop != nil {
+		for _, nd2 := range tracefunc.ApplyNormalFlow(instr, d2) {
+			for _, prevPoint := range tracefunc.GetPredecessors(v2) {
+				if loop := innermostLoopFor(tracefunc.ProgramPointPos(edge.Start.Point), loopInfos); loop != nil {
 					if isLoopIndexedAccess(instr, d2) {
 						reportNPlusOneAtSink(pass, edge.Start, reported)
 					}
