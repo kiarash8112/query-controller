@@ -67,8 +67,7 @@ The plugin registers as linter name **`nplusone`**.
 
 ### Build a custom golangci-lint binary
 
-1. Edit `analyzerVersion/.custom-gcl.yml` and set `path` to your local `analyzerVersion` directory.
-2. Build the custom binary:
+Create a `.custom-gcl.yml` (see `analyzerVersion/.custom-gcl.yml` for an example) and build the custom binary:
 
 ```bash
 cd analyzerVersion
