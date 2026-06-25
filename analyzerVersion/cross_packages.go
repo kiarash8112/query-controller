@@ -3,34 +3,18 @@ package linters
 import (
 	"reflect"
 
+	"github.com/kiarash8112/querycontrolleranalyzer/internal/return_to_params"
+	sinks "github.com/kiarash8112/querycontrolleranalyzer/internal/sink_finding"
+	tracefunc "github.com/kiarash8112/querycontrolleranalyzer/internal/trace_function"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/ssa"
 )
 
-type SinkParamFact struct {
-	SinkIndices []int
-}
-
-func (s *SinkParamFact) AFact()         {}
-func (s *SinkParamFact) String() string { return "SinkParamFact" }
-
-type ReturnToParamFact struct {
-	ResultToParams map[int][]int
-}
-
-func (r *ReturnToParamFact) AFact()         {}
-func (r *ReturnToParamFact) String() string { return "ReturnToParamFact" }
-
-type ExecutorFact struct{}
-
-func (e *ExecutorFact) AFact()         {}
-func (e *ExecutorFact) String() string { return "ExecutorFact" }
-
-func createCrossPackageFacts(pass *analysis.Pass) (map[*ssa.Function]*SinkParamFact, map[*ssa.Function]*ReturnToParamFact) {
+func createCrossPackageFacts(pass *analysis.Pass) (map[*ssa.Function]*sinks.SinkParamFact, map[*ssa.Function]*tracefunc.ReturnToParamFact) {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
-	localSinkFacts := make(map[*ssa.Function]*SinkParamFact)
-	localReturnFacts := make(map[*ssa.Function]*ReturnToParamFact)
+	localSinkFacts := make(map[*ssa.Function]*sinks.SinkParamFact)
+	localReturnFacts := make(map[*ssa.Function]*tracefunc.ReturnToParamFact)
 
 	funcs := ssaResult.SrcFuncs
 	changed := true
@@ -38,19 +22,19 @@ func createCrossPackageFacts(pass *analysis.Pass) (map[*ssa.Function]*SinkParamF
 		changed = false
 
 		for _, fn := range funcs {
-			newRetFact := buildReturnFact(fn, localReturnFacts, pass)
+			newRetFact := return_to_params.BuildReturnFact(fn, localReturnFacts, pass)
 			if !reflect.DeepEqual(localReturnFacts[fn], newRetFact) {
 				localReturnFacts[fn] = newRetFact
 				changed = true
 			}
 		}
 
-		directSinkFacts := make(map[*ssa.Function]*SinkParamFact, len(funcs))
+		directSinkFacts := make(map[*ssa.Function]*sinks.SinkParamFact, len(funcs))
 		for _, fn := range funcs {
-			directSinkFacts[fn] = buildDirectSinkFact(fn, localReturnFacts, pass)
+			directSinkFacts[fn] = sinks.BuildDirectSinkFact(fn, localReturnFacts, pass)
 		}
 
-		newSinkFacts := propagateSinkToPackageCallers(funcs, directSinkFacts, localReturnFacts, pass)
+		newSinkFacts := sinks.PropagateSinkToPackageCallers(funcs, directSinkFacts, localReturnFacts, pass)
 		for _, fn := range funcs {
 			if !reflect.DeepEqual(localSinkFacts[fn], newSinkFacts[fn]) {
 				localSinkFacts[fn] = newSinkFacts[fn]
@@ -59,7 +43,7 @@ func createCrossPackageFacts(pass *analysis.Pass) (map[*ssa.Function]*SinkParamF
 		}
 	}
 
-	executorSet := computeExecutorSet(funcs, pass)
+	executorSet := sinks.ComputeExecutorSet(funcs, pass)
 
 	for _, fn := range funcs {
 		obj := fn.Object()
@@ -71,7 +55,7 @@ func createCrossPackageFacts(pass *analysis.Pass) (map[*ssa.Function]*SinkParamF
 				pass.ExportObjectFact(obj, rf)
 			}
 			if executorSet[fn] {
-				pass.ExportObjectFact(obj, &ExecutorFact{})
+				pass.ExportObjectFact(obj, &sinks.ExecutorFact{})
 			}
 		}
 	}

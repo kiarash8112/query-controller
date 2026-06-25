@@ -23,7 +23,7 @@ A **sink** is not only a direct GORM call. If `functionA` runs a query and `func
 
 This phase does three things:
 
-1. **Find functions that execute or forward query data**
+1. **Find functions that execute or forward query data using ast**
 2. **Share summaries with other packages** (the Go analyzer runs per package)
 3. **Map return values back to parameters** (for cross-package tracing)
 

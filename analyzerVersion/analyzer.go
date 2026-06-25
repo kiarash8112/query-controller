@@ -1,9 +1,9 @@
 package linters
 
 import (
-	"go/ast"
-	"go/token"
-
+	"github.com/kiarash8112/querycontrolleranalyzer/internal/data_flow"
+	sinks "github.com/kiarash8112/querycontrolleranalyzer/internal/sink_finding"
+	tracefunc "github.com/kiarash8112/querycontrolleranalyzer/internal/trace_function"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
 )
@@ -16,71 +16,22 @@ var Analyzer = &analysis.Analyzer{
 		buildssa.Analyzer,
 	},
 	FactTypes: []analysis.Fact{
-		new(SinkParamFact),
-		new(ReturnToParamFact),
-		new(ExecutorFact),
+		new(sinks.SinkParamFact),
+		new(tracefunc.ReturnToParamFact),
+		new(sinks.ExecutorFact),
 	},
-}
-
-type LoopInfo struct {
-	Start token.Pos
-	End   token.Pos
-}
-
-func astContainsExecutionMethod(node ast.Node, executors map[string]bool) bool {
-	hasExecution := false
-	ast.Inspect(node, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		var name string
-		switch fun := call.Fun.(type) {
-		case *ast.SelectorExpr:
-			name = fun.Sel.Name
-		case *ast.Ident:
-			name = fun.Name
-		}
-		if isExecutionMethod(name) || executors[name] {
-			hasExecution = true
-			return false
-		}
-		return true
-	})
-	return hasExecution
-}
-
-func collectLoopInfo(pass *analysis.Pass, executors map[string]bool) []LoopInfo {
-	var loops []LoopInfo
-	for _, file := range pass.Files {
-		ast.Inspect(file, func(n ast.Node) bool {
-			switch loop := n.(type) {
-			case *ast.ForStmt:
-				if astContainsExecutionMethod(loop.Body, executors) {
-					loops = append(loops, LoopInfo{Start: loop.Pos(), End: loop.End()})
-				}
-			case *ast.RangeStmt:
-				if astContainsExecutionMethod(loop.Body, executors) {
-					loops = append(loops, LoopInfo{Start: loop.Pos(), End: loop.End()})
-				}
-			}
-			return true
-		})
-	}
-
-	return loops
 }
 
 func run(pass *analysis.Pass) (any, error) {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	funcs := ssaResult.SrcFuncs
 
-	executors := buildTransitiveExecutors(funcs, pass)
-	loopInfos := collectLoopInfo(pass, executors)
+	executors := sinks.BuildTransitiveExecutors(funcs, pass)
+	loopInfos := sinks.CollectLoopInfo(pass, executors)
 
 	localSinkFacts, localReturnFacts := createCrossPackageFacts(pass)
 
-	Phase1_Tabulation(funcs, localSinkFacts, localReturnFacts, loopInfos, pass)
+	data_flow.Phase1_Tabulation(funcs, localSinkFacts, localReturnFacts, loopInfos, pass)
 
 	return nil, nil
 }
