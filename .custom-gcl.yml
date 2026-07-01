@@ -3,4 +3,4 @@ version: v2.12.2
 plugins:
   - module: github.com/kiarash8112/query-controller
     import: github.com/kiarash8112/query-controller/plugin
-    version: latest
+    version: v0.0.1
