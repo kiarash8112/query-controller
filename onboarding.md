@@ -2,7 +2,7 @@
 
 This analyzer detects **true, data-dependent N+1 database queries** in Go. The core approach comes from Anders Møller's book [_Static Program Analysis_](https://cs.au.dk/~amoeller/spa/spa.pdf), adapted for GORM-style APIs and cross-package call graphs.
 
-For a shorter product overview, see the root [README](../README.md).
+For a shorter product overview, see [README.md](README.md).
 
 ## High-level algorithm
 

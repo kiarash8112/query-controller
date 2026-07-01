@@ -1,9 +1,9 @@
 package linters
 
 import (
-	"github.com/kiarash8112/querycontrolleranalyzer/internal/data_flow"
-	sinks "github.com/kiarash8112/querycontrolleranalyzer/internal/sink_finding"
-	tracefunc "github.com/kiarash8112/querycontrolleranalyzer/internal/trace_function"
+	"github.com/kiarash8112/query-controller/internal/data_flow"
+	sinks "github.com/kiarash8112/query-controller/internal/sink_finding"
+	tracefunc "github.com/kiarash8112/query-controller/internal/trace_function"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
 )

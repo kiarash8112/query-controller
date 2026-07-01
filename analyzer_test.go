@@ -5,7 +5,7 @@ import (
 	"runtime"
 	"testing"
 
-	_ "github.com/kiarash8112/querycontrolleranalyzer/plugin"
+	_ "github.com/kiarash8112/query-controller/plugin"
 	"github.com/golangci/plugin-module-register/register"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/tools/go/analysis/analysistest"

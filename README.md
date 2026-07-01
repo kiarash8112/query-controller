@@ -4,7 +4,7 @@ Static analyzer for detecting **true, data-dependent N+1 database query** patter
 
 Unlike pattern matchers that flag any query inside a loop, Query Controller uses IFDS-style tabulation to distinguish real N+1 issues (loop-indexed or phi-dependent values flowing into query arguments) from safe constant queries.
 
-For architecture, algorithm details, and contributor onboarding, see [analyzerVersion/onboarding.md](analyzerVersion/onboarding.md).
+For architecture, algorithm details, and contributor onboarding, see [onboarding.md](onboarding.md).
 
 ## How it works
 
@@ -30,39 +30,17 @@ Analysis runs in two phases:
 
 | Path | Description |
 |------|-------------|
-| `ifds.go`, `helper.go`, `ast.go`, `model.go` | Standalone CLI analyzer (stack-based IFDS) |
-| `examples/` | Sample Go packages used by the CLI |
-| `analyzerVersion/` | Production **golangci-lint plugin** with cross-package fact propagation |
-| `analyzerVersion/onboarding.md` | Architecture overview and contributor onboarding |
-| `analyzerVersion/code_examples/` | Test fixtures for the plugin |
+| `analyzer.go`, `cross_packages.go`, `internal/` | **golangci-lint plugin** with cross-package fact propagation |
+| `onboarding.md` | Architecture overview and contributor onboarding |
+| `code_examples/` | Test fixtures for the plugin |
+| `plugin/` | golangci-lint module plugin registration |
 
-The root package is a research/prototype CLI. The `analyzerVersion/` directory is the maintained linter implementation with cross-package summaries (`SinkParamFact`, `ReturnToParamFact`, `ExecutorFact`) and golangci-lint integration.
+The project is a golangci-lint plugin with cross-package summaries (`SinkParamFact`, `ReturnToParamFact`, `ExecutorFact`).
 
 ## Requirements
 
-- Go 1.23+ (root CLI)
-- Go 1.25+ (`analyzerVersion/` plugin and tests)
+- Go 1.25+
 - [golangci-lint v2](https://golangci-lint.run/) with [custom build support](https://golangci-lint.run/docs/plugins/module-plugins/) (for the plugin)
-
-## Standalone CLI
-
-Analyze a Go module directory (defaults to `examples/`):
-
-```bash
-go run . examples/example1
-```
-
-Pass a different target path as the first argument:
-
-```bash
-go run . /path/to/your/module
-```
-
-On success the tool prints a vulnerability report to stdout. A clean project prints:
-
-```
-✅ Project Clean! No N+1 Queries detected.
-```
 
 ## golangci-lint plugin
 
@@ -70,10 +48,9 @@ The plugin registers as linter name **`nplusone`**.
 
 ### Build a custom golangci-lint binary
 
-Create a `.custom-gcl.yml` (see `analyzerVersion/.custom-gcl.yml` for an example) and build the custom binary:
+Create a `.custom-gcl.yml` (see `.custom-gcl.yml` in the repo root) and build the custom binary:
 
 ```bash
-cd analyzerVersion
 golangci-lint custom
 ```
 
@@ -85,7 +62,7 @@ This produces a `custom-gcl` binary in the current directory.
 ./custom-gcl run ./...
 ```
 
-Configuration lives in `analyzerVersion/.golangci.yml`. Example diagnostic:
+Configuration lives in `.golangci.yml`. Example diagnostic:
 
 ```
 🚨 [TRUE N+1] Found dynamic database execution in loop (detected via dataflow)
@@ -93,14 +70,13 @@ Configuration lives in `analyzerVersion/.golangci.yml`. Example diagnostic:
 
 ## Tests
 
-Run plugin tests from the `analyzerVersion` directory:
+Run plugin tests from the project root:
 
 ```bash
-cd analyzerVersion
 go test ./...
 ```
 
-Tests cover scenarios such as base N+1, nested functions, tuple returns, recursion, dynamic query building, and state checking. Fixtures live under `analyzerVersion/code_examples/`.
+Tests cover scenarios such as base N+1, nested functions, tuple returns, recursion, dynamic query building, and state checking. Fixtures live under `code_examples/`.
 
 ## Detected APIs
 
@@ -117,8 +93,7 @@ The standalone CLI also treats `print` as an execution method for debugging.
 ## Limitations
 
 - Targets GORM-style method names; other ORMs are not modeled unless they use the same surface API.
-- Cross-package analysis is fully supported only in the `analyzerVersion` plugin (via exported analysis facts).
-- The standalone CLI uses a call-stack depth limit (`MaxCallStackDepth = 7`) for interprocedural tracing.
+- Cross-package analysis is supported via exported analysis facts.
 - Findings require data dependence on loop iteration; queries in loops with constant arguments are not reported.
 
 ## License

@@ -1,7 +1,7 @@
 package return_to_params
 
 import (
-	tracefunc "github.com/kiarash8112/querycontrolleranalyzer/internal/trace_function"
+	tracefunc "github.com/kiarash8112/query-controller/internal/trace_function"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ssa"
 )

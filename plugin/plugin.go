@@ -7,9 +7,9 @@ import (
 	"github.com/golangci/plugin-module-register/register"
 	"golang.org/x/tools/go/analysis"
 
-	linters "github.com/kiarash8112/querycontrolleranalyzer"
-	sinks "github.com/kiarash8112/querycontrolleranalyzer/internal/sink_finding"
-	tracefunc "github.com/kiarash8112/querycontrolleranalyzer/internal/trace_function"
+	linters "github.com/kiarash8112/query-controller"
+	sinks "github.com/kiarash8112/query-controller/internal/sink_finding"
+	tracefunc "github.com/kiarash8112/query-controller/internal/trace_function"
 )
 
 func init() {
