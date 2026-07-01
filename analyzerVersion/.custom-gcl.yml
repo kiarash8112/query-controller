@@ -1,6 +1,0 @@
-version: v2.12.2
-
-plugins:
-  - module: github.com/kiarash8112/querycontrolleranalyzer
-    import: github.com/kiarash8112/querycontrolleranalyzer/plugin
-    version: latest
