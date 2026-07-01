@@ -16,6 +16,7 @@ func init() {
 	register.Plugin("nplusone", New)
 	gob.Register(&sinks.SinkParamFact{})
 	gob.Register(&tracefunc.ReturnToParamFact{})
+	gob.Register(&sinks.ExecutorFact{})
 }
 
 type nplusonePlugin struct{}
