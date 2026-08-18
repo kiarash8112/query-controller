@@ -1,16 +1,12 @@
 # Onboarding: N+1 Analyzer
 
-This analyzer detects **true, data-dependent N+1 database queries** in Go. The core approach comes from Anders Møller's book [_Static Program Analysis_](https://cs.au.dk/~amoeller/spa/spa.pdf), adapted for GORM-style APIs and cross-package call graphs.
-
-For a shorter product overview, see [README.md](README.md).
-
 ## High-level algorithm
 
 Analysis runs in three conceptual steps:
 
 1. **Find sinks** — find functions that execute queries(we call them sink!)
 
-2. **Find candidate loops** — finding `for` loops whose body contains a query **execution** call (`Find`, `Scan`, `Exec`, etc.) or any function that execute query
+2. **Find candidate loops** — finding `for` loops whose body contains a query **execution** call (`Find`, `Scan`, `Exec`, etc.) or any function that execute query.(see code_examples/dynamic_build for better underestanding of why we have this step)
 
 3. **Trace dataflow** — From each sink argument inside a loop, walk backward through SSA. If a
    function parameter that used in query change based on loop we mark it as N+1 issue
@@ -29,7 +25,7 @@ This phase does three things:
 
 ### 1. Direct query sinks
 
-Scan SSA and mark GORM query-builder calls whose arguments should be traced. `getGormSinkArgs` and `isExecutionMethod` in `helper.go` handle this.
+Scan SSA and mark GORM query-builder calls whose arguments should be traced. `getGormSinkArgs` and `isExecutionMethod` handle this.
 
 - **Query sinks** (arguments traced): Where, Raw, Not, Or, Select, Exec
 
@@ -73,7 +69,7 @@ for _, user := range users {
 }
 ```
 
-Cross-package tracing needs to answer: _"this value came from `pkg2.GetUserID(user)` — from which argument was `id` created?"_
+Cross-package tracing needs to answer: _"this value came from `pkg2.GetUserID(user)` — from which argument was `id` created? (note that here we are doing backward analysis)"_
 
 `buildReturnFact` walks each `return` and uses `traceToParams` (another worklist over SSA) to record `ResultToParams`. See the [worklist algorithm](https://martinsteffen.github.io/compilerconstruction/worklistalgos/) reference for the general fixed-point pattern.
 
@@ -94,18 +90,3 @@ Cross-package tracing needs to answer: _"this value came from `pkg2.GetUserID(us
 
 Constants are pruned early (`*ssa.Const`), so queries with compile-time arguments inside loops are not reported.
 
-## Mental model
-
-```mermaid
-flowchart TD
-    A[SSA per package] --> B[Build return-to-param facts]
-    B --> C[Build sink-param facts]
-    C --> D[Export facts for importers]
-    A --> E[Find loops with execution calls]
-    C --> F[Seed sink args in loops]
-    E --> F
-    F --> G[Path-edge tabulation backward]
-    G --> H{Loop-dependent value?}
-    H -->|yes| I[Report N+1]
-    H -->|no| J[Safe / constant]
-```
